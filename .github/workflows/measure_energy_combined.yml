@@ -610,10 +610,27 @@ jobs:
       - name: Teardown Docker Environment
         if: always()
         run: |
-          docker stop "zulip-app-$env:RUN_ID" 2>$null
-          docker rm   "zulip-app-$env:RUN_ID" 2>$null
-          docker network rm "zulip-energy-net-$env:RUN_ID" 2>$null
+          $container = "zulip-app-$env:RUN_ID"
+          $network = "zulip-energy-net-$env:RUN_ID"
+
+          $containerId = docker ps -aq --filter "name=^$container$"
+          if ($containerId) {
+            docker rm -f $containerId 2>$null
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Unable to remove container $container" }
+          } else {
+            Write-Host "Container $container was not created; skipping removal."
+          }
+
+          $networkId = docker network ls -q --filter "name=^$network$"
+          if ($networkId) {
+            docker network rm $networkId 2>$null
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Unable to remove network $network" }
+          } else {
+            Write-Host "Network $network was not created; skipping removal."
+          }
+
           Write-Host "Docker environment cleaned up."
+          exit 0
         shell: powershell
 
       - name: Upload Traces as Artifact
@@ -766,10 +783,20 @@ jobs:
           "
 
           echo "Running Zulip provisioning (this may take several minutes)..."
-          docker exec "$CONTAINER_ID" bash -c "
-            cd /srv/zulip &&
-            ./tools/ci/setup-backend --skip-dev-db-build
-          " || echo "WARNING: Provisioning returned non-zero exit code. Attempting to continue..."
+          for ATTEMPT in 1 2 3; do
+            if docker exec "$CONTAINER_ID" bash -c "
+              cd /srv/zulip &&
+              ./tools/ci/setup-backend --skip-dev-db-build
+            "; then
+              break
+            fi
+            if [ "$ATTEMPT" -eq 3 ]; then
+              echo "ERROR: Provisioning failed after $ATTEMPT attempts"
+              exit 1
+            fi
+            echo "WARNING: Provisioning attempt $ATTEMPT failed, retrying..."
+            sleep $((ATTEMPT * 30))
+          done
 
           echo "Provisioning complete."
           echo "ZULIP_CONTAINER=$CONTAINER_ID" >> "$GITHUB_ENV"
@@ -838,7 +865,7 @@ jobs:
       # --- SCENARIO 4: BACKEND TEST SPANS ---
       - name: Profile Backend Test Spans
         run: |
-          set -euo pipefail
+          set -uo pipefail
           SCENARIO="Backend_Test_Spans"
           SCENARIO_DIR="$DATA_DIR/$SCENARIO"
           RAW_SPANS="$SCENARIO_DIR/pipeline_spans.ndjson"
@@ -855,6 +882,28 @@ jobs:
           FAILED_SPAN_COUNT=0
           START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
           START_EPOCH_MS=$(node -e "console.log(Date.now())")
+          FINALIZED=false
+
+          # Guarantees timestamps.csv/spans.json exist even if a span or the shell exits unexpectedly
+          finalize_backend() {
+            if [ "$FINALIZED" = true ]; then
+              return
+            fi
+            FINALIZED=true
+
+            local end_time
+            end_time=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+            sudo kill "$PROF_PID" 2>/dev/null || true
+            wait "$PROF_PID" 2>/dev/null || true
+
+            echo "${SCENARIO}_Start,$START_TIME,$W3C_TRACEPARENT,$START_EPOCH_MS" > "$SCENARIO_DIR/timestamps.csv"
+            echo "${SCENARIO}_End,$end_time,$W3C_TRACEPARENT" >> "$SCENARIO_DIR/timestamps.csv"
+
+            if [ -f "$RAW_SPANS" ]; then
+              node scripts/make_pipeline_spans.js build --input "$RAW_SPANS" --output "$SPANS_JSON" --traceparent "$W3C_TRACEPARENT" --scenario "$SCENARIO" || true
+            fi
+          }
+          trap finalize_backend EXIT
 
           run_backend_span() {
             local name="$1" calibration="$2" test_path="$3"
@@ -863,10 +912,11 @@ jobs:
             echo "Running backend test span: $name"
             local start_ms end_ms exit_code
             start_ms=$(node -e "console.log(Date.now())")
-            set +e
-            docker exec "$ZULIP_CONTAINER" bash -c "source tools/ci/activate-venv && ./tools/test-backend $* --parallel=1"
-            exit_code=$?
-            set -e
+            if docker exec "$ZULIP_CONTAINER" bash -c "source tools/ci/activate-venv && ./tools/test-backend $* --parallel=1"; then
+              exit_code=0
+            else
+              exit_code=$?
+            fi
             end_ms=$(node -e "console.log(Date.now())")
 
             if [ "$exit_code" -ne 0 ] && [ "$calibration" != "true" ]; then
@@ -1008,6 +1058,7 @@ jobs:
 
           END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
 
+          FINALIZED=true
           sleep 10
           sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
 
@@ -1055,10 +1106,11 @@ jobs:
             echo "Running frontend test span: $name"
             local start_ms end_ms exit_code
             start_ms=$(node -e "console.log(Date.now())")
-            set +e
-            docker exec "$ZULIP_CONTAINER" bash -c "source tools/ci/activate-venv && ./tools/test-js-with-node $* --parallel=1"
-            exit_code=$?
-            set -e
+            if docker exec "$ZULIP_CONTAINER" bash -c "source tools/ci/activate-venv && ./tools/test-js-with-node $* --parallel=1"; then
+              exit_code=0
+            else
+              exit_code=$?
+            fi
             end_ms=$(node -e "console.log(Date.now())")
 
             if [ "$exit_code" -ne 0 ] && [ "$calibration" != "true" ]; then
