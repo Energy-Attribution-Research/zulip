@@ -1,0 +1,1326 @@
+name: Zulip Energy Profiling (Combined Windows & Mac)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  profile-windows:
+    name: Profile AMD Windows
+    runs-on: [self-hosted, Windows]
+    permissions:
+      contents: write
+
+    env:
+      PROJECT_NAME: "zulip"
+      RUN_ID: "win_${{ github.run_id }}"
+      DATA_DIR: "D:\\myPortfolioProject\\zulip\\ResearchData\\cpudata\\win_${{ github.run_id }}"
+      UPROF_PATH: "C:\\Program Files\\AMD\\AMDuProf\\bin\\AMDuProfCLI.exe"
+      CI_IMAGE: "zulip/ci:bookworm"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare Directory Structure
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\Idle"
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\PNPM_Install"
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\Webpack_Build"
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\Backend_Test_Spans"
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\Frontend_Test_Spans"
+        shell: powershell
+
+      - name: Capture Hardware Metadata
+        run: |
+          $meta = @{
+            platform     = "amd_windows"
+            captured_at  = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            cpu_model    = (Get-CimInstance Win32_Processor).Name
+            cpu_cores    = (Get-CimInstance Win32_Processor).NumberOfCores
+            cpu_threads  = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+            cpu_max_mhz  = (Get-CimInstance Win32_Processor).MaxClockSpeed
+            ram_gb       = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+            os_version   = (Get-CimInstance Win32_OperatingSystem).Caption
+            docker_ver   = (docker --version)
+          }
+          $meta | ConvertTo-Json | Out-File -FilePath "$env:DATA_DIR\hardware_metadata.json" -Encoding utf8
+        shell: powershell
+
+      - name: Define Windows UTF-8 JSON Writer
+        run: |
+          @'
+          function Write-Utf8JsonNoBom($Path, $Value) {
+            $json = $Value | ConvertTo-Json -Compress
+            $encoding = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText($Path, $json, $encoding)
+          }
+          '@ | Out-File -FilePath "$env:DATA_DIR\write-json.ps1" -Encoding ascii
+        shell: powershell
+
+      - name: Pre-pull Images
+        run: |
+          docker pull --platform linux/amd64 $env:CI_IMAGE
+          docker pull --platform linux/amd64 node:22-slim
+        shell: powershell
+
+      # --- INFRASTRUCTURE: Provision Zulip inside container (not profiled) ---
+      - name: Provision Zulip Environment
+        run: |
+          Write-Host "Creating Docker network..."
+          docker network create zulip-energy-net-$env:RUN_ID 2>$null
+
+          Write-Host "Starting persistent Zulip CI container..."
+          $containerId = [string](docker run -d `
+            --name "zulip-app-$env:RUN_ID" `
+            --network "zulip-energy-net-$env:RUN_ID" `
+            --platform linux/amd64 `
+            -v "${PWD}:/srv/zulip" `
+            -w /srv/zulip `
+            -e HOME=/home/github `
+            -e CI=true `
+            $env:CI_IMAGE sleep infinity | Select-Object -Last 1)
+          $containerId = $containerId.Trim()
+          Write-Host "Container ID: $containerId"
+
+          Write-Host "Starting services inside container..."
+          docker exec $containerId bash -c "
+            sudo service redis-server start &&
+            sudo service memcached start &&
+            echo 'Core services started.'
+          "
+
+          Write-Host "Running Zulip provisioning (this may take several minutes)..."
+          docker exec $containerId bash -c "
+            cd /srv/zulip &&
+            ./tools/ci/setup-backend --skip-dev-db-build
+          "
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Provisioning returned non-zero exit code $LASTEXITCODE. Attempting to continue..."
+          }
+
+          Write-Host "Provisioning complete."
+          echo "ZULIP_CONTAINER=$containerId" | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+        shell: powershell
+
+      # --- SCENARIO 1: IDLE (BASELINE) ---
+      - name: Profile Idle Scenario
+        run: |
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d 60 -o `"$env:DATA_DIR\Idle\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          Start-Sleep -Seconds 30
+          $endTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+          echo "Idle_Start,$startTime,$w3cTraceparent" > "$env:DATA_DIR\Idle\timestamps.csv"
+          echo "Idle_End,$endTime,$w3cTraceparent" >> "$env:DATA_DIR\Idle\timestamps.csv"
+        shell: powershell
+
+      # --- SCENARIO 2: PNPM INSTALL ---
+      - name: Profile PNPM Install
+        run: |
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+          $profilerCap = 900
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$env:DATA_DIR\PNPM_Install\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/amd64 node:22-slim sh -c "corepack enable && corepack prepare pnpm@11.22.0 --activate && pnpm install --frozen-lockfile" ; $global:LASTEXITCODE = 0
+          $endTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+          echo "PNPM_Install_Start,$startTime,$w3cTraceparent" > "$env:DATA_DIR\PNPM_Install\timestamps.csv"
+          echo "PNPM_Install_End,$endTime,$w3cTraceparent" >> "$env:DATA_DIR\PNPM_Install\timestamps.csv"
+          $actualSec = ((Get-Date $endTime) - (Get-Date $startTime)).TotalSeconds
+          $usableCap = $profilerCap - 20
+          $truncated = $actualSec -gt $usableCap
+          . "$env:DATA_DIR\write-json.ps1"
+          Write-Utf8JsonNoBom "$env:DATA_DIR\PNPM_Install\duration_check.json" @{ task_seconds = [math]::Round($actualSec,2); profiler_cap_seconds = $profilerCap; usable_cap_seconds = $usableCap; truncated = $truncated }
+          if ($truncated) { Write-Error "TRUNCATED: PNPM Install ran ${actualSec}s but usable cap was ${usableCap}s"; exit 1 }
+        shell: powershell
+
+      # --- SCENARIO 3: WEBPACK BUILD ---
+      - name: Profile Webpack Build
+        run: |
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+          $profilerCap = 600
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$env:DATA_DIR\Webpack_Build\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          docker exec $env:ZULIP_CONTAINER bash -c "source tools/ci/activate-venv && ./tools/webpack --test" ; $global:LASTEXITCODE = 0
+          $endTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+          echo "Webpack_Build_Start,$startTime,$w3cTraceparent" > "$env:DATA_DIR\Webpack_Build\timestamps.csv"
+          echo "Webpack_Build_End,$endTime,$w3cTraceparent" >> "$env:DATA_DIR\Webpack_Build\timestamps.csv"
+          $actualSec = ((Get-Date $endTime) - (Get-Date $startTime)).TotalSeconds
+          $usableCap = $profilerCap - 20
+          $truncated = $actualSec -gt $usableCap
+          . "$env:DATA_DIR\write-json.ps1"
+          Write-Utf8JsonNoBom "$env:DATA_DIR\Webpack_Build\duration_check.json" @{ task_seconds = [math]::Round($actualSec,2); profiler_cap_seconds = $profilerCap; usable_cap_seconds = $usableCap; truncated = $truncated }
+          if ($truncated) { Write-Error "TRUNCATED: Webpack Build ran ${actualSec}s but usable cap was ${usableCap}s"; exit 1 }
+        shell: powershell
+
+      # --- SCENARIO 4: BACKEND TEST SPANS (Django test suite by group) ---
+      - name: Profile Backend Test Spans
+        run: |
+          $scenario = "Backend_Test_Spans"
+          $scenarioDir = Join-Path $env:DATA_DIR $scenario
+          $rawSpans = Join-Path $scenarioDir "pipeline_spans.ndjson"
+          $spansJson = Join-Path $scenarioDir "spans.json"
+          Remove-Item -LiteralPath $rawSpans, $spansJson -Force -ErrorAction SilentlyContinue
+
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+
+          $profilerCap = 7200
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$scenarioDir\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+
+          $failedSpanCount = 0
+          $scenarioStartClock = Get-Date
+          $startTime = $scenarioStartClock.ToString("yyyy-MM-dd HH:mm:ss.fff")
+          $startEpochMs = [DateTimeOffset]::new($scenarioStartClock, [System.TimeZoneInfo]::Local.GetUtcOffset($scenarioStartClock)).ToUnixTimeMilliseconds()
+
+          function Invoke-BackendSpan {
+            param(
+              [Parameter(Mandatory=$true)][string]$Name,
+              [Parameter(Mandatory=$true)][string[]]$TestModules,
+              [string]$TestPath = "",
+              [bool]$Calibration = $false
+            )
+
+            Write-Host "Running backend test span: $Name"
+            $startMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+            $testArgs = $TestModules -join " "
+            docker exec $env:ZULIP_CONTAINER bash -c "source tools/ci/activate-venv && ./tools/test-backend $testArgs --parallel=1"
+            $exitCode = $LASTEXITCODE
+            $endMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+
+            if ($exitCode -ne 0 -and -not $Calibration) {
+              $script:failedSpanCount += 1
+              Write-Warning "Span $Name exited with code $exitCode; recording and continuing."
+            }
+
+            $commandText = "tools/test-backend " + $testArgs
+            node scripts\make_pipeline_spans.js record `
+              --output "$rawSpans" `
+              --name "$Name" `
+              --start-ms "$startMs" `
+              --end-ms "$endMs" `
+              --exit-code "$exitCode" `
+              --test-path "$TestPath" `
+              --command "$commandText" `
+              --calibration "$Calibration" `
+              --operation "django-test-group"
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to record pipeline span $Name"
+            }
+          }
+
+          # Calibration spans (3x — empty filter that matches no tests)
+          for ($i = 1; $i -le 3; $i++) {
+            Invoke-BackendSpan -Name "django.Calibration.$i" -TestModules @("zerver.tests.test_example") -TestPath "" -Calibration $true
+          }
+
+          # Group 1: Messaging
+          Invoke-BackendSpan -Name "django.messaging" -TestModules @(
+            "zerver.tests.test_message_delete", "zerver.tests.test_message_dict",
+            "zerver.tests.test_message_edit", "zerver.tests.test_message_edit_notifications",
+            "zerver.tests.test_message_fetch", "zerver.tests.test_message_flags",
+            "zerver.tests.test_message_move_stream", "zerver.tests.test_message_move_topic",
+            "zerver.tests.test_message_notification_emails", "zerver.tests.test_message_report",
+            "zerver.tests.test_message_send", "zerver.tests.test_message_summary",
+            "zerver.tests.test_message_topics", "zerver.tests.test_message_triggered_bots",
+            "zerver.tests.test_messages"
+          ) -TestPath "zerver/tests/test_message_*"
+
+          # Group 2: Channels & Subscriptions
+          Invoke-BackendSpan -Name "django.channels" -TestModules @(
+            "zerver.tests.test_channel_access", "zerver.tests.test_channel_creation",
+            "zerver.tests.test_channel_fetch", "zerver.tests.test_channel_folders",
+            "zerver.tests.test_channel_permissions", "zerver.tests.test_subs",
+            "zerver.tests.test_subscription_settings", "zerver.tests.test_default_channels"
+          ) -TestPath "zerver/tests/test_channel_*"
+
+          # Group 3: Authentication & Signup
+          Invoke-BackendSpan -Name "django.auth" -TestModules @(
+            "zerver.tests.test_auth_backends", "zerver.tests.test_signup",
+            "zerver.tests.test_invite", "zerver.tests.test_sessions",
+            "zerver.tests.test_decorators", "zerver.tests.test_scim"
+          ) -TestPath "zerver/tests/test_auth_*"
+
+          # Group 4: Users
+          Invoke-BackendSpan -Name "django.users" -TestModules @(
+            "zerver.tests.test_users", "zerver.tests.test_user_groups",
+            "zerver.tests.test_user_status", "zerver.tests.test_user_topics",
+            "zerver.tests.test_new_users", "zerver.tests.test_muted_users",
+            "zerver.tests.test_custom_profile_data", "zerver.tests.test_mirror_users"
+          ) -TestPath "zerver/tests/test_user*"
+
+          # Group 5: Events
+          Invoke-BackendSpan -Name "django.events" -TestModules @(
+            "zerver.tests.test_events", "zerver.tests.test_event_queue",
+            "zerver.tests.test_event_system"
+          ) -TestPath "zerver/tests/test_event*"
+
+          # Group 6: Push Notifications
+          Invoke-BackendSpan -Name "django.push" -TestModules @(
+            "zerver.tests.test_push_notifications", "zerver.tests.test_push_registration",
+            "zerver.tests.test_handle_push_notification", "zerver.tests.test_e2ee_push_notifications"
+          ) -TestPath "zerver/tests/test_push_*"
+
+          # Group 7: Data Import/Export
+          Invoke-BackendSpan -Name "django.imports" -TestModules @(
+            "zerver.tests.test_import_export", "zerver.tests.test_slack_importer",
+            "zerver.tests.test_slack_message_conversion", "zerver.tests.test_mattermost_importer",
+            "zerver.tests.test_rocketchat_importer", "zerver.tests.test_microsoft_teams_importer"
+          ) -TestPath "zerver/tests/test_*_importer"
+
+          # Group 8: Realm/Organization
+          Invoke-BackendSpan -Name "django.realm" -TestModules @(
+            "zerver.tests.test_realm", "zerver.tests.test_realm_creation",
+            "zerver.tests.test_realm_domains", "zerver.tests.test_realm_emoji",
+            "zerver.tests.test_realm_export", "zerver.tests.test_realm_linkifiers",
+            "zerver.tests.test_realm_playgrounds"
+          ) -TestPath "zerver/tests/test_realm*"
+
+          # Group 9: Email
+          Invoke-BackendSpan -Name "django.email" -TestModules @(
+            "zerver.tests.test_email_change", "zerver.tests.test_email_log",
+            "zerver.tests.test_email_mirror", "zerver.tests.test_email_notifications",
+            "zerver.tests.test_send_email", "zerver.tests.test_digest"
+          ) -TestPath "zerver/tests/test_email_*"
+
+          # Group 10: Uploads & Media
+          Invoke-BackendSpan -Name "django.uploads" -TestModules @(
+            "zerver.tests.test_upload", "zerver.tests.test_upload_local",
+            "zerver.tests.test_upload_s3", "zerver.tests.test_thumbnail",
+            "zerver.tests.test_markdown_thumbnail", "zerver.tests.test_tusd",
+            "zerver.tests.test_delete_unclaimed_attachments", "zerver.tests.test_attachments"
+          ) -TestPath "zerver/tests/test_upload*"
+
+          # Group 11: Markdown & Rendering
+          Invoke-BackendSpan -Name "django.markdown" -TestModules @(
+            "zerver.tests.test_markdown", "zerver.tests.test_link_embed"
+          ) -TestPath "zerver/tests/test_markdown*"
+
+          # Group 12: Bots & Integrations
+          Invoke-BackendSpan -Name "django.bots" -TestModules @(
+            "zerver.tests.test_bots", "zerver.tests.test_embedded_bot_system",
+            "zerver.tests.test_outgoing_webhook_interfaces", "zerver.tests.test_outgoing_webhook_system",
+            "zerver.tests.test_outgoing_http", "zerver.tests.test_webhooks_common",
+            "zerver.tests.test_integrations", "zerver.tests.test_integrations_dev_panel"
+          ) -TestPath "zerver/tests/test_bots*"
+
+          # Group 13: Corporate
+          Invoke-BackendSpan -Name "django.corporate" -TestModules @("corporate.tests") -TestPath "corporate/tests"
+
+          # Group 14: Analytics
+          Invoke-BackendSpan -Name "django.analytics" -TestModules @("analytics.tests") -TestPath "analytics/tests"
+
+          # Group 15: Miscellaneous (everything not covered above)
+          Invoke-BackendSpan -Name "django.misc" -TestModules @(
+            "zerver.tests.test_alert_words", "zerver.tests.test_audit_log",
+            "zerver.tests.test_cache", "zerver.tests.test_checks",
+            "zerver.tests.test_compatibility", "zerver.tests.test_create_video_call",
+            "zerver.tests.test_devices", "zerver.tests.test_docs",
+            "zerver.tests.test_drafts", "zerver.tests.test_example",
+            "zerver.tests.test_exception_filter", "zerver.tests.test_external",
+            "zerver.tests.test_github", "zerver.tests.test_health",
+            "zerver.tests.test_home", "zerver.tests.test_i18n",
+            "zerver.tests.test_internet", "zerver.tests.test_legacy_subject",
+            "zerver.tests.test_llms_txt", "zerver.tests.test_management_commands",
+            "zerver.tests.test_middleware", "zerver.tests.test_migration_status",
+            "zerver.tests.test_migrations", "zerver.tests.test_navigation_views",
+            "zerver.tests.test_notification_data", "zerver.tests.test_onboarding",
+            "zerver.tests.test_onboarding_steps", "zerver.tests.test_openapi",
+            "zerver.tests.test_parallel", "zerver.tests.test_populate_db",
+            "zerver.tests.test_presence", "zerver.tests.test_queue",
+            "zerver.tests.test_queue_worker", "zerver.tests.test_rate_limiter",
+            "zerver.tests.test_reactions", "zerver.tests.test_read_receipts",
+            "zerver.tests.test_recipient_parsing", "zerver.tests.test_redis_utils",
+            "zerver.tests.test_reminders", "zerver.tests.test_report",
+            "zerver.tests.test_retention", "zerver.tests.test_saved_snippets",
+            "zerver.tests.test_scheduled_messages", "zerver.tests.test_server_settings",
+            "zerver.tests.test_settings", "zerver.tests.test_soft_deactivation",
+            "zerver.tests.test_subdomains", "zerver.tests.test_submessage",
+            "zerver.tests.test_templates", "zerver.tests.test_timeout",
+            "zerver.tests.test_timestamp", "zerver.tests.test_timezone",
+            "zerver.tests.test_topic_link_util", "zerver.tests.test_tornado",
+            "zerver.tests.test_transfer", "zerver.tests.test_tutorial",
+            "zerver.tests.test_typed_endpoint", "zerver.tests.test_typed_endpoint_validators",
+            "zerver.tests.test_typing", "zerver.tests.test_url_decoding",
+            "zerver.tests.test_url_encoding", "zerver.tests.test_urls",
+            "zerver.tests.test_validators", "zerver.tests.test_welcome_bot_custom_message",
+            "zerver.tests.test_widgets", "zerver.tests.test_zcommand",
+            "zerver.tests.test_zilencer_analytics", "zerver.tests.test_zulip_update_announcements"
+          ) -TestPath "zerver/tests/misc"
+
+          $scenarioEndClock = Get-Date
+          $endTime = $scenarioEndClock.ToString("yyyy-MM-dd HH:mm:ss.fff")
+
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+
+          echo "${scenario}_Start,$startTime,$w3cTraceparent,$startEpochMs" > "$scenarioDir\timestamps.csv"
+          echo "${scenario}_End,$endTime,$w3cTraceparent" >> "$scenarioDir\timestamps.csv"
+
+          node scripts\make_pipeline_spans.js build --input "$rawSpans" --output "$spansJson" --traceparent "$w3cTraceparent" --scenario "$scenario"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to build spans.json for $scenario" }
+
+          $actualSec = ($scenarioEndClock - $scenarioStartClock).TotalSeconds
+          $usableCap = $profilerCap - 20
+          $truncated = $actualSec -gt $usableCap
+          $spanCount = @(Get-Content -LiteralPath $rawSpans | Where-Object { $_.Trim().Length -gt 0 }).Count
+          . "$env:DATA_DIR\write-json.ps1"
+          Write-Utf8JsonNoBom "$scenarioDir\duration_check.json" @{
+            scenario = $scenario
+            profiler_cap_seconds = $profilerCap
+            usable_cap_seconds = $usableCap
+            actual_duration_seconds = [math]::Round($actualSec, 2)
+            task_seconds = [math]::Round($actualSec, 2)
+            truncated = $truncated
+            overrun = $truncated
+            span_count = $spanCount
+            failed_span_count = $failedSpanCount
+            calibration_repetitions = 3
+          }
+
+          if ($spanCount -ne 18) {
+            Write-Error "Expected 18 span records but found $spanCount"
+            exit 1
+          }
+
+          if ($truncated) {
+            Write-Error "TRUNCATED DATA: Backend tests ran ${actualSec}s but profiler usable window was ${usableCap}s"
+            exit 1
+          }
+        shell: powershell
+
+      # --- SCENARIO 5: FRONTEND TEST SPANS (Node.js tests by group) ---
+      - name: Profile Frontend Test Spans
+        run: |
+          $scenario = "Frontend_Test_Spans"
+          $scenarioDir = Join-Path $env:DATA_DIR $scenario
+          $rawSpans = Join-Path $scenarioDir "pipeline_spans.ndjson"
+          $spansJson = Join-Path $scenarioDir "spans.json"
+          Remove-Item -LiteralPath $rawSpans, $spansJson -Force -ErrorAction SilentlyContinue
+
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+
+          $profilerCap = 3600
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$scenarioDir\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+
+          $failedSpanCount = 0
+          $scenarioStartClock = Get-Date
+          $startTime = $scenarioStartClock.ToString("yyyy-MM-dd HH:mm:ss.fff")
+          $startEpochMs = [DateTimeOffset]::new($scenarioStartClock, [System.TimeZoneInfo]::Local.GetUtcOffset($scenarioStartClock)).ToUnixTimeMilliseconds()
+
+          function Invoke-FrontendSpan {
+            param(
+              [Parameter(Mandatory=$true)][string]$Name,
+              [Parameter(Mandatory=$true)][string[]]$TestFiles,
+              [string]$TestPath = "",
+              [bool]$Calibration = $false
+            )
+
+            Write-Host "Running frontend test span: $Name"
+            $startMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+            $testArgs = $TestFiles -join " "
+            docker exec $env:ZULIP_CONTAINER bash -c "source tools/ci/activate-venv && ./tools/test-js-with-node $testArgs --parallel=1"
+            $exitCode = $LASTEXITCODE
+            $endMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+
+            if ($exitCode -ne 0 -and -not $Calibration) {
+              $script:failedSpanCount += 1
+              Write-Warning "Span $Name exited with code $exitCode; recording and continuing."
+            }
+
+            $commandText = "tools/test-js-with-node " + $testArgs
+            node scripts\make_pipeline_spans.js record `
+              --output "$rawSpans" `
+              --name "$Name" `
+              --start-ms "$startMs" `
+              --end-ms "$endMs" `
+              --exit-code "$exitCode" `
+              --test-path "$TestPath" `
+              --command "$commandText" `
+              --calibration "$Calibration" `
+              --operation "node-test-group"
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to record pipeline span $Name"
+            }
+          }
+
+          # Calibration spans (3x — run a single fast test)
+          for ($i = 1; $i -le 3; $i++) {
+            Invoke-FrontendSpan -Name "node.Calibration.$i" -TestFiles @("util.test.cjs") -TestPath "" -Calibration $true
+          }
+
+          # Group 1: Compose
+          Invoke-FrontendSpan -Name "node.compose" -TestFiles @(
+            "compose.test.cjs", "compose_actions.test.cjs", "compose_call.test.cjs",
+            "compose_call_session.test.cjs", "compose_closed_ui.test.cjs",
+            "compose_fade.test.cjs", "compose_paste.test.cjs",
+            "compose_pm_pill.test.cjs", "compose_reply.test.cjs",
+            "compose_state.test.cjs"
+          ) -TestPath "web/tests/compose*"
+
+          # Group 2: Message
+          Invoke-FrontendSpan -Name "node.message" -TestFiles @(
+            "message_edit.test.cjs", "message_edit_history.test.cjs",
+            "message_events.test.cjs", "message_fetch.test.cjs",
+            "message_feed_loading.test.cjs", "message_feed_top_notices.test.cjs",
+            "message_groups.test.cjs", "message_helper.test.cjs",
+            "message_list.test.cjs", "message_list_data.test.cjs",
+            "message_list_view.test.cjs", "message_lists.test.cjs",
+            "message_parser.test.cjs", "message_scroll_state.test.cjs",
+            "message_store.test.cjs", "message_view.test.cjs"
+          ) -TestPath "web/tests/message*"
+
+          # Group 3: Stream/Channel
+          Invoke-FrontendSpan -Name "node.stream" -TestFiles @(
+            "stream_color.test.cjs", "stream_create_subscribers.test.cjs",
+            "stream_data.test.cjs", "stream_events.test.cjs",
+            "stream_list.test.cjs", "stream_peer_data.test.cjs",
+            "stream_pill.test.cjs", "stream_search_pill.test.cjs",
+            "stream_settings_ui.test.cjs", "stream_sort.test.cjs",
+            "stream_subscription.test.cjs", "stream_topic_history.test.cjs",
+            "channel.test.cjs", "channel_folders.test.cjs"
+          ) -TestPath "web/tests/stream*"
+
+          # Group 4: Settings
+          Invoke-FrontendSpan -Name "node.settings" -TestFiles @(
+            "settings_bots.test.cjs", "settings_config.test.cjs",
+            "settings_data.test.cjs", "settings_org.test.cjs",
+            "settings_user_groups_legacy.test.cjs"
+          ) -TestPath "web/tests/settings*"
+
+          # Group 5: Activity & Presence
+          Invoke-FrontendSpan -Name "node.activity" -TestFiles @(
+            "activity.test.cjs", "activity_init.test.cjs",
+            "activity_post.test.cjs", "activity_ui.test.cjs",
+            "buddy_data.test.cjs", "buddy_list.test.cjs",
+            "presence.test.cjs"
+          ) -TestPath "web/tests/activity*"
+
+          # Group 6: Search & Filter
+          Invoke-FrontendSpan -Name "node.search" -TestFiles @(
+            "search.test.cjs", "search_future.test.cjs",
+            "search_pill.test.cjs", "filter.test.cjs"
+          ) -TestPath "web/tests/search*"
+
+          # Group 7: Misc (everything else — run the full suite minus specific files)
+          Invoke-FrontendSpan -Name "node.misc" -TestFiles @(
+            "alert_words.test.cjs", "alert_words_ui.test.cjs",
+            "bot_data.test.cjs", "browser_history.test.cjs",
+            "browser_support.test.cjs", "clipboard_handler.test.cjs",
+            "color_data.test.cjs", "common.test.cjs",
+            "components.test.cjs", "copy_and_paste.test.cjs",
+            "csrf.test.cjs", "custom_profile_fields_ui.test.cjs",
+            "desktop_integration.test.cjs", "dialog_widget.test.cjs",
+            "dispatch.test.cjs", "drafts.test.cjs",
+            "echo.test.cjs", "emoji.test.cjs", "emoji_picker.test.cjs",
+            "feedback_widget.test.cjs", "flatpickr.test.cjs",
+            "fold_dict.test.cjs", "hash_util.test.cjs",
+            "hashchange.test.cjs", "hotkey.test.cjs",
+            "i18n.test.cjs", "input_pill.test.cjs",
+            "integration_url_modal.test.cjs",
+            "lib.test.cjs", "lightbox.test.cjs",
+            "list_widget.test.cjs", "listbox_selector.test.cjs",
+            "markdown.test.cjs", "markdown_parse.test.cjs",
+            "muted_users.test.cjs", "narrow.test.cjs",
+            "narrow_activate.test.cjs", "narrow_local.test.cjs",
+            "narrow_state.test.cjs", "navbar_alerts.test.cjs",
+            "navigate.test.cjs", "notifications.test.cjs",
+            "onboarding_steps.test.cjs", "overlays.test.cjs",
+            "padded_widget.test.cjs", "people.test.cjs",
+            "pm_conversations.test.cjs", "pm_list_data.test.cjs",
+            "poll_widget.test.cjs", "popover_menus_data.test.cjs",
+            "popovers.test.cjs", "reactions.test.cjs",
+            "recent_senders.test.cjs", "recent_view_data.test.cjs",
+            "recent_view_util.test.cjs", "rendered_markdown.test.cjs",
+            "scheduled_messages.test.cjs", "scroll_util.test.cjs",
+            "server_events.test.cjs", "spoilers.test.cjs",
+            "starred_messages.test.cjs", "state_data.test.cjs",
+            "submessage.test.cjs", "subscriber_api.test.cjs",
+            "timerender.test.cjs", "todo_widget.test.cjs",
+            "topic_link_util.test.cjs", "topic_list.test.cjs",
+            "topic_list_data.test.cjs", "transmit.test.cjs",
+            "tutorial.test.cjs", "typeahead.test.cjs",
+            "typeahead_helper.test.cjs", "typing.test.cjs",
+            "typing_events.test.cjs", "typing_status.test.cjs",
+            "unread.test.cjs", "unread_ops.test.cjs",
+            "upload.test.cjs", "url_encoding.test.cjs",
+            "user_card_popover.test.cjs", "user_deactivation.test.cjs",
+            "user_groups.test.cjs", "user_pill.test.cjs",
+            "user_search.test.cjs", "user_status.test.cjs",
+            "user_status_ui.test.cjs", "user_topics.test.cjs",
+            "util.test.cjs", "vdom.test.cjs",
+            "widgetize.test.cjs"
+          ) -TestPath "web/tests/misc"
+
+          $scenarioEndClock = Get-Date
+          $endTime = $scenarioEndClock.ToString("yyyy-MM-dd HH:mm:ss.fff")
+
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+
+          echo "${scenario}_Start,$startTime,$w3cTraceparent,$startEpochMs" > "$scenarioDir\timestamps.csv"
+          echo "${scenario}_End,$endTime,$w3cTraceparent" >> "$scenarioDir\timestamps.csv"
+
+          node scripts\make_pipeline_spans.js build --input "$rawSpans" --output "$spansJson" --traceparent "$w3cTraceparent" --scenario "$scenario"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to build spans.json for $scenario" }
+
+          $actualSec = ($scenarioEndClock - $scenarioStartClock).TotalSeconds
+          $usableCap = $profilerCap - 20
+          $truncated = $actualSec -gt $usableCap
+          $spanCount = @(Get-Content -LiteralPath $rawSpans | Where-Object { $_.Trim().Length -gt 0 }).Count
+          . "$env:DATA_DIR\write-json.ps1"
+          Write-Utf8JsonNoBom "$scenarioDir\duration_check.json" @{
+            scenario = $scenario
+            profiler_cap_seconds = $profilerCap
+            usable_cap_seconds = $usableCap
+            actual_duration_seconds = [math]::Round($actualSec, 2)
+            task_seconds = [math]::Round($actualSec, 2)
+            truncated = $truncated
+            overrun = $truncated
+            span_count = $spanCount
+            failed_span_count = $failedSpanCount
+            calibration_repetitions = 3
+          }
+
+          if ($spanCount -ne 10) {
+            Write-Error "Expected 10 span records but found $spanCount"
+            exit 1
+          }
+
+          if ($truncated) {
+            Write-Error "TRUNCATED DATA: Frontend tests ran ${actualSec}s but profiler usable window was ${usableCap}s"
+            exit 1
+          }
+        shell: powershell
+
+      # --- TEARDOWN ---
+      - name: Teardown Docker Environment
+        if: always()
+        run: |
+          docker stop "zulip-app-$env:RUN_ID" 2>$null
+          docker rm   "zulip-app-$env:RUN_ID" 2>$null
+          docker network rm "zulip-energy-net-$env:RUN_ID" 2>$null
+          Write-Host "Docker environment cleaned up."
+        shell: powershell
+
+      - name: Upload Traces as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: energy-traces-${{ env.RUN_ID }}
+          path: ${{ env.DATA_DIR }}
+          retention-days: 90
+
+      - name: Offload to MinIO Bucket
+        env:
+          AWS_ACCESS_KEY_ID: researcher
+          AWS_SECRET_ACCESS_KEY: supersecretpassword
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          Write-Host "Compressing Raw Telemetry..."
+          $scenarios = @("Idle", "PNPM_Install", "Webpack_Build", "Backend_Test_Spans", "Frontend_Test_Spans")
+          foreach ($scenario in $scenarios) {
+            $scenarioDir = Join-Path $env:DATA_DIR $scenario
+            $rootTimechart = Join-Path $scenarioDir "timechart.csv"
+            $timestamps = Join-Path $scenarioDir "timestamps.csv"
+
+            if (-not (Test-Path -LiteralPath $rootTimechart)) {
+              $nested = Get-ChildItem -LiteralPath $scenarioDir -Recurse -Filter "timechart.csv" -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              if ($null -eq $nested) { throw "Missing timechart.csv for $scenario" }
+              Copy-Item -LiteralPath $nested.FullName -Destination $rootTimechart -Force
+            }
+
+            foreach ($f in @($rootTimechart, $timestamps)) {
+              if (-not (Test-Path -LiteralPath $f)) { throw "Missing: $f" }
+              if ((Get-Item -LiteralPath $f).Length -eq 0) { throw "Empty: $f" }
+            }
+
+            $files = @($rootTimechart, $timestamps)
+            $durationCheck = Join-Path $scenarioDir "duration_check.json"
+            if (Test-Path -LiteralPath $durationCheck) { $files += $durationCheck }
+            foreach ($spanScenario in @("Backend_Test_Spans", "Frontend_Test_Spans")) {
+              if ($scenario -eq $spanScenario) {
+                $spansJson = Join-Path $scenarioDir "spans.json"
+                if (-not (Test-Path -LiteralPath $spansJson)) { throw "Missing spans.json for $scenario" }
+                if ((Get-Item -LiteralPath $spansJson).Length -eq 0) { throw "Empty spans.json for $scenario" }
+                $files += $spansJson
+              }
+            }
+            Compress-Archive -LiteralPath $files -DestinationPath "$env:DATA_DIR\$scenario.zip" -Force
+          }
+
+          $awsExe = "C:\Program Files\Amazon\AWSCLIV2\aws.exe"
+          & $awsExe s3 cp "$env:DATA_DIR\hardware_metadata.json" "s3://energy-research-data/raw-telemetry/$env:PROJECT_NAME/$env:RUN_ID/hardware_metadata.json" --endpoint-url http://100.100.223.40:9000
+          foreach ($scenario in $scenarios) {
+            & $awsExe s3 cp "$env:DATA_DIR\$scenario.zip" "s3://energy-research-data/raw-telemetry/$env:PROJECT_NAME/$env:RUN_ID/$scenario.zip" --endpoint-url http://100.100.223.40:9000
+          }
+          Remove-Item -Path "$env:DATA_DIR" -Recurse -Force
+        shell: powershell
+
+  profile-mac:
+    name: Profile Apple Mac M2
+    runs-on: [self-hosted, macos]
+    permissions:
+      contents: write
+
+    env:
+      PROJECT_NAME: "zulip"
+      RUN_ID: "mac_${{ github.run_id }}"
+      DATA_DIR: "${{ github.workspace }}/ResearchData/cpudata/mac_${{ github.run_id }}"
+      CI_IMAGE: "zulip/ci:bookworm"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare Directory Structure
+        run: |
+          mkdir -p "$DATA_DIR/Idle"
+          mkdir -p "$DATA_DIR/PNPM_Install"
+          mkdir -p "$DATA_DIR/Webpack_Build"
+          mkdir -p "$DATA_DIR/Backend_Test_Spans"
+          mkdir -p "$DATA_DIR/Frontend_Test_Spans"
+        shell: bash
+
+      - name: Capture Hardware Metadata
+        run: |
+          META_FILE="$DATA_DIR/hardware_metadata.json"
+          CPU_MODEL=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple Silicon")
+          TOTAL_CORES=$(sysctl -n hw.physicalcpu)
+          P_CORES=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || echo "N/A")
+          E_CORES=$(sysctl -n hw.perflevel1.physicalcpu 2>/dev/null || echo "N/A")
+          CPU_THREADS=$(sysctl -n hw.logicalcpu)
+          RAM_GB=$(echo "scale=1; $(sysctl -n hw.memsize) / 1073741824" | bc)
+          OS_VER=$(sw_vers -productVersion)
+          DOCKER_VER=$(docker --version)
+          cat > "$META_FILE" << EOFMETA
+          {
+            "platform": "mac_m2_macos",
+            "captured_at": "$(date '+%Y-%m-%d %H:%M:%S')",
+            "cpu_model": "$CPU_MODEL",
+            "cpu_cores": $TOTAL_CORES,
+            "cpu_p_cores": "$P_CORES",
+            "cpu_e_cores": "$E_CORES",
+            "cpu_threads": $CPU_THREADS,
+            "ram_gb": $RAM_GB,
+            "os_version": "macOS $OS_VER",
+            "docker_ver": "$DOCKER_VER"
+          }
+          EOFMETA
+        shell: bash
+
+      - name: Build ARM64 CI Image
+        run: |
+          echo "Building native ARM64 Zulip CI image from tools/ci/Dockerfile..."
+          # Build without --platform=linux/amd64 to get native arm64
+          docker build tools/ci/ \
+            --build-arg=BASE_IMAGE=debian:bookworm \
+            --tag zulip-ci-arm64:latest \
+            --file tools/ci/Dockerfile
+          echo "ARM64 CI image built successfully."
+        shell: bash
+
+      - name: Pre-pull Images
+        run: |
+          docker pull --platform linux/arm64 node:22-slim
+        shell: bash
+
+      # --- INFRASTRUCTURE: Provision Zulip inside container (not profiled) ---
+      - name: Provision Zulip Environment
+        run: |
+          echo "Creating Docker network..."
+          docker network create "zulip-energy-net-${RUN_ID}" || true
+
+          echo "Starting persistent Zulip CI container (ARM64 native)..."
+          CONTAINER_ID=$(docker run -d \
+            --name "zulip-app-${RUN_ID}" \
+            --network "zulip-energy-net-${RUN_ID}" \
+            -v "${PWD}:/srv/zulip" \
+            -w /srv/zulip \
+            -e HOME=/home/github \
+            -e CI=true \
+            zulip-ci-arm64:latest sleep infinity)
+          CONTAINER_ID=$(echo "$CONTAINER_ID" | tr -d '[:space:]')
+          echo "Container ID: $CONTAINER_ID"
+
+          echo "Starting services inside container..."
+          docker exec "$CONTAINER_ID" bash -c "
+            sudo service redis-server start &&
+            sudo service memcached start &&
+            echo 'Core services started.'
+          "
+
+          echo "Running Zulip provisioning (this may take several minutes)..."
+          docker exec "$CONTAINER_ID" bash -c "
+            cd /srv/zulip &&
+            ./tools/ci/setup-backend --skip-dev-db-build
+          " || echo "WARNING: Provisioning returned non-zero exit code. Attempting to continue..."
+
+          echo "Provisioning complete."
+          echo "ZULIP_CONTAINER=$CONTAINER_ID" >> "$GITHUB_ENV"
+        shell: bash
+
+      # --- SCENARIO 1: IDLE (BASELINE) ---
+      - name: Profile Idle Scenario
+        run: |
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          sudo powermetrics --samplers cpu_power -i 100 -n 600 > "$DATA_DIR/Idle/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 30
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+          echo "Idle_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/Idle/timestamps.csv"
+          echo "Idle_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/Idle/timestamps.csv"
+        shell: bash
+
+      # --- SCENARIO 2: PNPM INSTALL ---
+      - name: Profile PNPM Install
+        run: |
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          PROFILER_CAP=900
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$DATA_DIR/PNPM_Install/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/arm64 node:22-slim sh -c "corepack enable && corepack prepare pnpm@11.22.0 --activate && pnpm install --frozen-lockfile" || true
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+          echo "PNPM_Install_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/PNPM_Install/timestamps.csv"
+          echo "PNPM_Install_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/PNPM_Install/timestamps.csv"
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          echo "{\"task_seconds\": $ACTUAL_SEC, \"profiler_cap_seconds\": $PROFILER_CAP, \"usable_cap_seconds\": $USABLE_CAP, \"truncated\": $TRUNCATED}" > "$DATA_DIR/PNPM_Install/duration_check.json"
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: PNPM Install ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
+        shell: bash
+
+      # --- SCENARIO 3: WEBPACK BUILD ---
+      - name: Profile Webpack Build
+        run: |
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          PROFILER_CAP=600
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$DATA_DIR/Webpack_Build/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          docker exec "$ZULIP_CONTAINER" bash -c "source tools/ci/activate-venv && ./tools/webpack --test" || true
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+          echo "Webpack_Build_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/Webpack_Build/timestamps.csv"
+          echo "Webpack_Build_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/Webpack_Build/timestamps.csv"
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          echo "{\"task_seconds\": $ACTUAL_SEC, \"profiler_cap_seconds\": $PROFILER_CAP, \"usable_cap_seconds\": $USABLE_CAP, \"truncated\": $TRUNCATED}" > "$DATA_DIR/Webpack_Build/duration_check.json"
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: Webpack Build ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
+        shell: bash
+
+      # --- SCENARIO 4: BACKEND TEST SPANS ---
+      - name: Profile Backend Test Spans
+        run: |
+          set -euo pipefail
+          SCENARIO="Backend_Test_Spans"
+          SCENARIO_DIR="$DATA_DIR/$SCENARIO"
+          RAW_SPANS="$SCENARIO_DIR/pipeline_spans.ndjson"
+          SPANS_JSON="$SCENARIO_DIR/spans.json"
+          rm -f "$RAW_SPANS" "$SPANS_JSON"
+
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+
+          PROFILER_CAP=7200
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$SCENARIO_DIR/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+
+          FAILED_SPAN_COUNT=0
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          START_EPOCH_MS=$(node -e "console.log(Date.now())")
+
+          run_backend_span() {
+            local name="$1" calibration="$2" test_path="$3"
+            shift 3
+
+            echo "Running backend test span: $name"
+            local start_ms end_ms exit_code
+            start_ms=$(node -e "console.log(Date.now())")
+            set +e
+            docker exec "$ZULIP_CONTAINER" bash -c "source tools/ci/activate-venv && ./tools/test-backend $* --parallel=1"
+            exit_code=$?
+            set -e
+            end_ms=$(node -e "console.log(Date.now())")
+
+            if [ "$exit_code" -ne 0 ] && [ "$calibration" != "true" ]; then
+              FAILED_SPAN_COUNT=$((FAILED_SPAN_COUNT + 1))
+              echo "WARNING: Span $name exited $exit_code"
+            fi
+
+            node scripts/make_pipeline_spans.js record \
+              --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
+              --exit-code "$exit_code" --test-path "$test_path" --command "tools/test-backend $*" \
+              --calibration "$calibration" --operation "django-test-group"
+          }
+
+          # Calibration (3x)
+          for REP in 1 2 3; do
+            run_backend_span "django.Calibration.$REP" "true" "" zerver.tests.test_example
+          done
+
+          # Group 1: Messaging
+          run_backend_span "django.messaging" "false" "zerver/tests/test_message_*" \
+            zerver.tests.test_message_delete zerver.tests.test_message_dict \
+            zerver.tests.test_message_edit zerver.tests.test_message_edit_notifications \
+            zerver.tests.test_message_fetch zerver.tests.test_message_flags \
+            zerver.tests.test_message_move_stream zerver.tests.test_message_move_topic \
+            zerver.tests.test_message_notification_emails zerver.tests.test_message_report \
+            zerver.tests.test_message_send zerver.tests.test_message_summary \
+            zerver.tests.test_message_topics zerver.tests.test_message_triggered_bots \
+            zerver.tests.test_messages
+
+          # Group 2: Channels
+          run_backend_span "django.channels" "false" "zerver/tests/test_channel_*" \
+            zerver.tests.test_channel_access zerver.tests.test_channel_creation \
+            zerver.tests.test_channel_fetch zerver.tests.test_channel_folders \
+            zerver.tests.test_channel_permissions zerver.tests.test_subs \
+            zerver.tests.test_subscription_settings zerver.tests.test_default_channels
+
+          # Group 3: Auth
+          run_backend_span "django.auth" "false" "zerver/tests/test_auth_*" \
+            zerver.tests.test_auth_backends zerver.tests.test_signup \
+            zerver.tests.test_invite zerver.tests.test_sessions \
+            zerver.tests.test_decorators zerver.tests.test_scim
+
+          # Group 4: Users
+          run_backend_span "django.users" "false" "zerver/tests/test_user*" \
+            zerver.tests.test_users zerver.tests.test_user_groups \
+            zerver.tests.test_user_status zerver.tests.test_user_topics \
+            zerver.tests.test_new_users zerver.tests.test_muted_users \
+            zerver.tests.test_custom_profile_data zerver.tests.test_mirror_users
+
+          # Group 5: Events
+          run_backend_span "django.events" "false" "zerver/tests/test_event*" \
+            zerver.tests.test_events zerver.tests.test_event_queue \
+            zerver.tests.test_event_system
+
+          # Group 6: Push Notifications
+          run_backend_span "django.push" "false" "zerver/tests/test_push_*" \
+            zerver.tests.test_push_notifications zerver.tests.test_push_registration \
+            zerver.tests.test_handle_push_notification zerver.tests.test_e2ee_push_notifications
+
+          # Group 7: Imports
+          run_backend_span "django.imports" "false" "zerver/tests/test_*_importer" \
+            zerver.tests.test_import_export zerver.tests.test_slack_importer \
+            zerver.tests.test_slack_message_conversion zerver.tests.test_mattermost_importer \
+            zerver.tests.test_rocketchat_importer zerver.tests.test_microsoft_teams_importer
+
+          # Group 8: Realm
+          run_backend_span "django.realm" "false" "zerver/tests/test_realm*" \
+            zerver.tests.test_realm zerver.tests.test_realm_creation \
+            zerver.tests.test_realm_domains zerver.tests.test_realm_emoji \
+            zerver.tests.test_realm_export zerver.tests.test_realm_linkifiers \
+            zerver.tests.test_realm_playgrounds
+
+          # Group 9: Email
+          run_backend_span "django.email" "false" "zerver/tests/test_email_*" \
+            zerver.tests.test_email_change zerver.tests.test_email_log \
+            zerver.tests.test_email_mirror zerver.tests.test_email_notifications \
+            zerver.tests.test_send_email zerver.tests.test_digest
+
+          # Group 10: Uploads
+          run_backend_span "django.uploads" "false" "zerver/tests/test_upload*" \
+            zerver.tests.test_upload zerver.tests.test_upload_local \
+            zerver.tests.test_upload_s3 zerver.tests.test_thumbnail \
+            zerver.tests.test_markdown_thumbnail zerver.tests.test_tusd \
+            zerver.tests.test_delete_unclaimed_attachments zerver.tests.test_attachments
+
+          # Group 11: Markdown
+          run_backend_span "django.markdown" "false" "zerver/tests/test_markdown*" \
+            zerver.tests.test_markdown zerver.tests.test_link_embed
+
+          # Group 12: Bots & Integrations
+          run_backend_span "django.bots" "false" "zerver/tests/test_bots*" \
+            zerver.tests.test_bots zerver.tests.test_embedded_bot_system \
+            zerver.tests.test_outgoing_webhook_interfaces zerver.tests.test_outgoing_webhook_system \
+            zerver.tests.test_outgoing_http zerver.tests.test_webhooks_common \
+            zerver.tests.test_integrations zerver.tests.test_integrations_dev_panel
+
+          # Group 13: Corporate
+          run_backend_span "django.corporate" "false" "corporate/tests" corporate.tests
+
+          # Group 14: Analytics
+          run_backend_span "django.analytics" "false" "analytics/tests" analytics.tests
+
+          # Group 15: Miscellaneous
+          run_backend_span "django.misc" "false" "zerver/tests/misc" \
+            zerver.tests.test_alert_words zerver.tests.test_audit_log \
+            zerver.tests.test_cache zerver.tests.test_checks \
+            zerver.tests.test_compatibility zerver.tests.test_create_video_call \
+            zerver.tests.test_devices zerver.tests.test_docs \
+            zerver.tests.test_drafts zerver.tests.test_example \
+            zerver.tests.test_exception_filter zerver.tests.test_external \
+            zerver.tests.test_github zerver.tests.test_health \
+            zerver.tests.test_home zerver.tests.test_i18n \
+            zerver.tests.test_internet zerver.tests.test_legacy_subject \
+            zerver.tests.test_llms_txt zerver.tests.test_management_commands \
+            zerver.tests.test_middleware zerver.tests.test_migration_status \
+            zerver.tests.test_migrations zerver.tests.test_navigation_views \
+            zerver.tests.test_notification_data zerver.tests.test_onboarding \
+            zerver.tests.test_onboarding_steps zerver.tests.test_openapi \
+            zerver.tests.test_parallel zerver.tests.test_populate_db \
+            zerver.tests.test_presence zerver.tests.test_queue \
+            zerver.tests.test_queue_worker zerver.tests.test_rate_limiter \
+            zerver.tests.test_reactions zerver.tests.test_read_receipts \
+            zerver.tests.test_recipient_parsing zerver.tests.test_redis_utils \
+            zerver.tests.test_reminders zerver.tests.test_report \
+            zerver.tests.test_retention zerver.tests.test_saved_snippets \
+            zerver.tests.test_scheduled_messages zerver.tests.test_server_settings \
+            zerver.tests.test_settings zerver.tests.test_soft_deactivation \
+            zerver.tests.test_subdomains zerver.tests.test_submessage \
+            zerver.tests.test_templates zerver.tests.test_timeout \
+            zerver.tests.test_timestamp zerver.tests.test_timezone \
+            zerver.tests.test_topic_link_util zerver.tests.test_tornado \
+            zerver.tests.test_transfer zerver.tests.test_tutorial \
+            zerver.tests.test_typed_endpoint zerver.tests.test_typed_endpoint_validators \
+            zerver.tests.test_typing zerver.tests.test_url_decoding \
+            zerver.tests.test_url_encoding zerver.tests.test_urls \
+            zerver.tests.test_validators zerver.tests.test_welcome_bot_custom_message \
+            zerver.tests.test_widgets zerver.tests.test_zcommand \
+            zerver.tests.test_zilencer_analytics zerver.tests.test_zulip_update_announcements
+
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+
+          echo "${SCENARIO}_Start,$START_TIME,$W3C_TRACEPARENT,$START_EPOCH_MS" > "$SCENARIO_DIR/timestamps.csv"
+          echo "${SCENARIO}_End,$END_TIME,$W3C_TRACEPARENT" >> "$SCENARIO_DIR/timestamps.csv"
+
+          node scripts/make_pipeline_spans.js build --input "$RAW_SPANS" --output "$SPANS_JSON" --traceparent "$W3C_TRACEPARENT" --scenario "$SCENARIO"
+
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          SPAN_COUNT=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS")
+          cat > "$SCENARIO_DIR/duration_check.json" << EOFJSON
+          {"scenario": "$SCENARIO", "profiler_cap_seconds": $PROFILER_CAP, "usable_cap_seconds": $USABLE_CAP, "actual_duration_seconds": $ACTUAL_SEC, "task_seconds": $ACTUAL_SEC, "truncated": $TRUNCATED, "overrun": $TRUNCATED, "span_count": $SPAN_COUNT, "failed_span_count": $FAILED_SPAN_COUNT, "calibration_repetitions": 3}
+          EOFJSON
+
+          if [ "$SPAN_COUNT" -ne 18 ]; then echo "Expected 18 span records but found $SPAN_COUNT"; exit 1; fi
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: Backend tests ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
+        shell: bash
+
+      # --- SCENARIO 5: FRONTEND TEST SPANS ---
+      - name: Profile Frontend Test Spans
+        run: |
+          set -euo pipefail
+          SCENARIO="Frontend_Test_Spans"
+          SCENARIO_DIR="$DATA_DIR/$SCENARIO"
+          RAW_SPANS="$SCENARIO_DIR/pipeline_spans.ndjson"
+          SPANS_JSON="$SCENARIO_DIR/spans.json"
+          rm -f "$RAW_SPANS" "$SPANS_JSON"
+
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          PROFILER_CAP=3600
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$SCENARIO_DIR/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+
+          FAILED_SPAN_COUNT=0
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          START_EPOCH_MS=$(node -e "console.log(Date.now())")
+
+          run_frontend_span() {
+            local name="$1" calibration="$2" test_path="$3"
+            shift 3
+
+            echo "Running frontend test span: $name"
+            local start_ms end_ms exit_code
+            start_ms=$(node -e "console.log(Date.now())")
+            set +e
+            docker exec "$ZULIP_CONTAINER" bash -c "source tools/ci/activate-venv && ./tools/test-js-with-node $* --parallel=1"
+            exit_code=$?
+            set -e
+            end_ms=$(node -e "console.log(Date.now())")
+
+            if [ "$exit_code" -ne 0 ] && [ "$calibration" != "true" ]; then
+              FAILED_SPAN_COUNT=$((FAILED_SPAN_COUNT + 1))
+              echo "WARNING: Span $name exited $exit_code"
+            fi
+
+            node scripts/make_pipeline_spans.js record \
+              --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
+              --exit-code "$exit_code" --test-path "$test_path" --command "tools/test-js-with-node $*" \
+              --calibration "$calibration" --operation "node-test-group"
+          }
+
+          # Calibration (3x)
+          for REP in 1 2 3; do
+            run_frontend_span "node.Calibration.$REP" "true" "" util.test.cjs
+          done
+
+          # Group 1: Compose
+          run_frontend_span "node.compose" "false" "web/tests/compose*" \
+            compose.test.cjs compose_actions.test.cjs compose_call.test.cjs \
+            compose_call_session.test.cjs compose_closed_ui.test.cjs \
+            compose_fade.test.cjs compose_paste.test.cjs \
+            compose_pm_pill.test.cjs compose_reply.test.cjs \
+            compose_state.test.cjs
+
+          # Group 2: Message
+          run_frontend_span "node.message" "false" "web/tests/message*" \
+            message_edit.test.cjs message_edit_history.test.cjs \
+            message_events.test.cjs message_fetch.test.cjs \
+            message_feed_loading.test.cjs message_feed_top_notices.test.cjs \
+            message_groups.test.cjs message_helper.test.cjs \
+            message_list.test.cjs message_list_data.test.cjs \
+            message_list_view.test.cjs message_lists.test.cjs \
+            message_parser.test.cjs message_scroll_state.test.cjs \
+            message_store.test.cjs message_view.test.cjs
+
+          # Group 3: Stream/Channel
+          run_frontend_span "node.stream" "false" "web/tests/stream*" \
+            stream_color.test.cjs stream_create_subscribers.test.cjs \
+            stream_data.test.cjs stream_events.test.cjs \
+            stream_list.test.cjs stream_peer_data.test.cjs \
+            stream_pill.test.cjs stream_search_pill.test.cjs \
+            stream_settings_ui.test.cjs stream_sort.test.cjs \
+            stream_subscription.test.cjs stream_topic_history.test.cjs \
+            channel.test.cjs channel_folders.test.cjs
+
+          # Group 4: Settings
+          run_frontend_span "node.settings" "false" "web/tests/settings*" \
+            settings_bots.test.cjs settings_config.test.cjs \
+            settings_data.test.cjs settings_org.test.cjs \
+            settings_user_groups_legacy.test.cjs
+
+          # Group 5: Activity
+          run_frontend_span "node.activity" "false" "web/tests/activity*" \
+            activity.test.cjs activity_init.test.cjs \
+            activity_post.test.cjs activity_ui.test.cjs \
+            buddy_data.test.cjs buddy_list.test.cjs \
+            presence.test.cjs
+
+          # Group 6: Search
+          run_frontend_span "node.search" "false" "web/tests/search*" \
+            search.test.cjs search_future.test.cjs \
+            search_pill.test.cjs filter.test.cjs
+
+          # Group 7: Misc
+          run_frontend_span "node.misc" "false" "web/tests/misc" \
+            alert_words.test.cjs alert_words_ui.test.cjs \
+            bot_data.test.cjs browser_history.test.cjs \
+            browser_support.test.cjs clipboard_handler.test.cjs \
+            color_data.test.cjs common.test.cjs \
+            components.test.cjs copy_and_paste.test.cjs \
+            csrf.test.cjs custom_profile_fields_ui.test.cjs \
+            desktop_integration.test.cjs dialog_widget.test.cjs \
+            dispatch.test.cjs drafts.test.cjs \
+            echo.test.cjs emoji.test.cjs emoji_picker.test.cjs \
+            feedback_widget.test.cjs flatpickr.test.cjs \
+            fold_dict.test.cjs hash_util.test.cjs \
+            hashchange.test.cjs hotkey.test.cjs \
+            i18n.test.cjs input_pill.test.cjs \
+            integration_url_modal.test.cjs \
+            lib.test.cjs lightbox.test.cjs \
+            list_widget.test.cjs listbox_selector.test.cjs \
+            markdown.test.cjs markdown_parse.test.cjs \
+            muted_users.test.cjs narrow.test.cjs \
+            narrow_activate.test.cjs narrow_local.test.cjs \
+            narrow_state.test.cjs navbar_alerts.test.cjs \
+            navigate.test.cjs notifications.test.cjs \
+            onboarding_steps.test.cjs overlays.test.cjs \
+            padded_widget.test.cjs people.test.cjs \
+            pm_conversations.test.cjs pm_list_data.test.cjs \
+            poll_widget.test.cjs popover_menus_data.test.cjs \
+            popovers.test.cjs reactions.test.cjs \
+            recent_senders.test.cjs recent_view_data.test.cjs \
+            recent_view_util.test.cjs rendered_markdown.test.cjs \
+            scheduled_messages.test.cjs scroll_util.test.cjs \
+            server_events.test.cjs spoilers.test.cjs \
+            starred_messages.test.cjs state_data.test.cjs \
+            submessage.test.cjs subscriber_api.test.cjs \
+            timerender.test.cjs todo_widget.test.cjs \
+            topic_link_util.test.cjs topic_list.test.cjs \
+            topic_list_data.test.cjs transmit.test.cjs \
+            tutorial.test.cjs typeahead.test.cjs \
+            typeahead_helper.test.cjs typing.test.cjs \
+            typing_events.test.cjs typing_status.test.cjs \
+            unread.test.cjs unread_ops.test.cjs \
+            upload.test.cjs url_encoding.test.cjs \
+            user_card_popover.test.cjs user_deactivation.test.cjs \
+            user_groups.test.cjs user_pill.test.cjs \
+            user_search.test.cjs user_status.test.cjs \
+            user_status_ui.test.cjs user_topics.test.cjs \
+            vdom.test.cjs widgetize.test.cjs
+
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+
+          echo "${SCENARIO}_Start,$START_TIME,$W3C_TRACEPARENT,$START_EPOCH_MS" > "$SCENARIO_DIR/timestamps.csv"
+          echo "${SCENARIO}_End,$END_TIME,$W3C_TRACEPARENT" >> "$SCENARIO_DIR/timestamps.csv"
+
+          node scripts/make_pipeline_spans.js build --input "$RAW_SPANS" --output "$SPANS_JSON" --traceparent "$W3C_TRACEPARENT" --scenario "$SCENARIO"
+
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          SPAN_COUNT=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS")
+          cat > "$SCENARIO_DIR/duration_check.json" << EOFJSON
+          {"scenario": "$SCENARIO", "profiler_cap_seconds": $PROFILER_CAP, "usable_cap_seconds": $USABLE_CAP, "actual_duration_seconds": $ACTUAL_SEC, "task_seconds": $ACTUAL_SEC, "truncated": $TRUNCATED, "overrun": $TRUNCATED, "span_count": $SPAN_COUNT, "failed_span_count": $FAILED_SPAN_COUNT, "calibration_repetitions": 3}
+          EOFJSON
+
+          if [ "$SPAN_COUNT" -ne 10 ]; then echo "Expected 10 span records but found $SPAN_COUNT"; exit 1; fi
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: Frontend tests ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
+        shell: bash
+
+      # --- CONVERT: powermetrics to AMD-compatible timechart.csv ---
+      - name: Convert powermetrics to timechart.csv
+        if: always()
+        run: |
+          echo "Converting powermetrics output to AMD-compatible timechart.csv..."
+          python3 scripts/parse_powermetrics.py "$RUN_ID"
+        shell: bash
+
+      - name: Validate Converted Data
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "Validating converted timechart.csv files..."
+          FAIL=0
+          for SCENARIO in Idle PNPM_Install Webpack_Build Backend_Test_Spans Frontend_Test_Spans; do
+            CSV="$DATA_DIR/$SCENARIO/timechart.csv"
+            TS="$DATA_DIR/$SCENARIO/timestamps.csv"
+            if [ ! -f "$CSV" ]; then
+              echo "ERROR: MISSING: $CSV"
+              FAIL=1
+            elif [ ! -s "$CSV" ]; then
+              echo "ERROR: EMPTY: $CSV"
+              FAIL=1
+            else
+              ROWS=$(tail -n +3 "$CSV" | wc -l | tr -d ' ')
+              if [ "$ROWS" -lt 1 ]; then
+                echo "ERROR: EMPTY: $CSV has 0 data rows"
+                FAIL=1
+              else
+                echo "OK: $SCENARIO: $ROWS data rows"
+              fi
+            fi
+
+            if [ ! -f "$TS" ]; then
+              echo "ERROR: MISSING: $TS"
+              FAIL=1
+            elif [ ! -s "$TS" ]; then
+              echo "ERROR: EMPTY: $TS"
+              FAIL=1
+            fi
+
+            for SPAN_SCENARIO in Backend_Test_Spans Frontend_Test_Spans; do
+              if [ "$SCENARIO" = "$SPAN_SCENARIO" ]; then
+                SPANS="$DATA_DIR/$SCENARIO/spans.json"
+                if [ ! -f "$SPANS" ]; then
+                  echo "ERROR: MISSING: $SPANS"
+                  FAIL=1
+                elif [ ! -s "$SPANS" ]; then
+                  echo "ERROR: EMPTY: $SPANS"
+                  FAIL=1
+                fi
+              fi
+            done
+          done
+          if [ $FAIL -eq 1 ]; then
+            echo "ERROR: VALIDATION FAILED — corrupt data will NOT be uploaded"
+            exit 1
+          else
+            echo "OK: All telemetry files validated successfully"
+          fi
+        shell: bash
+
+      # --- TEARDOWN ---
+      - name: Teardown Docker Environment
+        if: always()
+        run: |
+          docker stop "zulip-app-${RUN_ID}" 2>/dev/null || true
+          docker rm   "zulip-app-${RUN_ID}" 2>/dev/null || true
+          docker network rm "zulip-energy-net-${RUN_ID}" 2>/dev/null || true
+          echo "Docker environment cleaned up."
+        shell: bash
+
+      - name: Upload Traces as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: energy-traces-${{ env.RUN_ID }}
+          path: ${{ env.DATA_DIR }}
+          retention-days: 90
+
+      - name: Offload to MinIO Bucket
+        env:
+          AWS_ACCESS_KEY_ID: researcher
+          AWS_SECRET_ACCESS_KEY: supersecretpassword
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          echo "Compressing Raw Telemetry..."
+          for SCENARIO in Idle PNPM_Install Webpack_Build Backend_Test_Spans Frontend_Test_Spans; do
+            SCENARIO_DIR="$DATA_DIR/$SCENARIO"
+            FILES=("$SCENARIO_DIR/timechart.csv" "$SCENARIO_DIR/timestamps.csv")
+
+            for REQUIRED_FILE in "$SCENARIO_DIR/timechart.csv" "$SCENARIO_DIR/timestamps.csv"; do
+              if [ ! -s "$REQUIRED_FILE" ]; then
+                echo "ERROR: Missing or empty required telemetry file: $REQUIRED_FILE"
+                exit 1
+              fi
+            done
+
+            if [ -f "$SCENARIO_DIR/duration_check.json" ]; then
+              FILES+=("$SCENARIO_DIR/duration_check.json")
+            fi
+
+            for SPAN_SCENARIO in Backend_Test_Spans Frontend_Test_Spans; do
+              if [ "$SCENARIO" = "$SPAN_SCENARIO" ]; then
+                if [ ! -s "$SCENARIO_DIR/spans.json" ]; then
+                  echo "ERROR: Missing or empty spans.json for $SCENARIO"
+                  exit 1
+                fi
+                FILES+=("$SCENARIO_DIR/spans.json")
+              fi
+            done
+
+            zip -j "$DATA_DIR/${SCENARIO}.zip" "${FILES[@]}"
+            zip -T "$DATA_DIR/${SCENARIO}.zip"
+          done
+
+          echo "Uploading to MinIO Cloud (zulip project)..."
+          docker run --rm -v "$DATA_DIR:/data" --entrypoint sh minio/mc -c "\
+            mc alias set myminio http://100.100.223.40:9000 researcher supersecretpassword && \
+            mc cp /data/hardware_metadata.json myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/hardware_metadata.json && \
+            mc cp /data/Idle.zip             myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/Idle.zip && \
+            mc cp /data/PNPM_Install.zip     myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/PNPM_Install.zip && \
+            mc cp /data/Webpack_Build.zip    myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/Webpack_Build.zip && \
+            mc cp /data/Backend_Test_Spans.zip  myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/Backend_Test_Spans.zip && \
+            mc cp /data/Frontend_Test_Spans.zip myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/Frontend_Test_Spans.zip"
+
+          echo "Cleaning up local disk..."
+          rm -rf "$DATA_DIR"
+        shell: bash
