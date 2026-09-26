@@ -1,11 +1,26 @@
 name: Zulip Energy Profiling (Combined Windows & Mac)
+# Governed runs carry the Governance Agent's conversation id in their title; the runner agent
+# that won the Contract Net finds its run by it.
+run-name: ${{ inputs.governance_session_id != '' && format('Governed run {0} ({1})', inputs.governance_session_id, inputs.target_platform) || 'Zulip Energy Profiling (Combined Windows & Mac)' }}
 
 on:
   workflow_dispatch:
+    inputs:
+      governance_session_id:
+        description: "Governance Agent conversation id (set by the runner agent)"
+        required: false
+        default: ""
+      target_platform:
+        description: "Which runner profiles this run (the Contract Net winner, or both for paired data)"
+        required: false
+        default: "both"
+        type: choice
+        options: [both, amd_windows, mac_m2_macos]
 
 jobs:
   profile-windows:
     name: Profile AMD Windows
+    if: ${{ inputs.target_platform != 'mac_m2_macos' }}
     runs-on: [self-hosted, Windows]
     permissions:
       contents: write
@@ -689,6 +704,7 @@ jobs:
 
   profile-mac:
     name: Profile Apple Mac M2
+    if: ${{ inputs.target_platform != 'amd_windows' }}
     runs-on: [self-hosted, macos]
     permissions:
       contents: write
