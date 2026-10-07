@@ -33,6 +33,10 @@ jobs:
       CI_IMAGE: "zulip/ci:bookworm"
 
     steps:
+      - name: Enable Git Long Paths
+        run: git config --global core.longpaths true
+        shell: powershell
+
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
@@ -787,6 +791,11 @@ jobs:
             -w /srv/zulip \
             -e HOME=/home/github \
             -e CI=true \
+            -e NPM_CONFIG_FETCH_TIMEOUT=600000 \
+            -e NPM_CONFIG_FETCH_RETRIES=6 \
+            -e NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=10000 \
+            -e NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=120000 \
+            -e NPM_CONFIG_NETWORK_CONCURRENCY=8 \
             zulip-ci-arm64:latest sleep infinity)
           CONTAINER_ID=$(echo "$CONTAINER_ID" | tr -d '[:space:]')
           echo "Container ID: $CONTAINER_ID"
@@ -802,6 +811,11 @@ jobs:
           for ATTEMPT in 1 2 3; do
             if docker exec "$CONTAINER_ID" bash -c "
               cd /srv/zulip &&
+              corepack pnpm config set fetch-timeout 600000 &&
+              corepack pnpm config set fetch-retries 6 &&
+              corepack pnpm config set fetch-retry-mintimeout 10000 &&
+              corepack pnpm config set fetch-retry-maxtimeout 120000 &&
+              corepack pnpm config set network-concurrency 8 &&
               ./tools/ci/setup-backend --skip-dev-db-build
             "; then
               break
@@ -811,7 +825,7 @@ jobs:
               exit 1
             fi
             echo "WARNING: Provisioning attempt $ATTEMPT failed, retrying..."
-            sleep $((ATTEMPT * 30))
+            sleep $((ATTEMPT * 60))
           done
 
           echo "Provisioning complete."
@@ -1264,14 +1278,14 @@ jobs:
 
       # --- CONVERT: powermetrics to AMD-compatible timechart.csv ---
       - name: Convert powermetrics to timechart.csv
-        if: always()
+        if: success()
         run: |
           echo "Converting powermetrics output to AMD-compatible timechart.csv..."
           python3 scripts/parse_powermetrics.py "$RUN_ID"
         shell: bash
 
       - name: Validate Converted Data
-        if: always()
+        if: success()
         run: |
           set -euo pipefail
           echo "Validating converted timechart.csv files..."
