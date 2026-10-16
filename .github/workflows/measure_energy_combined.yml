@@ -718,6 +718,33 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Infrastructure only: runs before any profiled scenario.
+      - name: Ensure Docker Desktop is ready
+        run: |
+          set -euo pipefail
+
+          if ! docker info >/dev/null 2>&1; then
+            echo "Docker daemon is unavailable; starting Docker Desktop..."
+            open -a Docker || true
+          fi
+
+          for attempt in {1..60}; do
+            if docker info >/dev/null 2>&1; then
+              echo "Docker daemon is ready."
+              docker version
+              exit 0
+            fi
+            echo "Waiting for Docker Desktop (${attempt}/60)..."
+            sleep 5
+          done
+
+          echo "ERROR: Docker Desktop did not become ready."
+          docker context ls || true
+          echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+          docker info || true
+          exit 1
+        shell: bash
+
       - name: Prepare Directory Structure
         run: |
           mkdir -p "$DATA_DIR/Idle"
