@@ -34,7 +34,10 @@ jobs:
 
     steps:
       - name: Enable Git Long Paths
-        run: git config --global core.longpaths true
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+          git config --global core.eol lf
         shell: powershell
 
       - name: Checkout Code
@@ -84,45 +87,6 @@ jobs:
           docker pull --platform linux/amd64 node:22-slim
         shell: powershell
 
-      # --- INFRASTRUCTURE: Provision Zulip inside container (not profiled) ---
-      - name: Provision Zulip Environment
-        run: |
-          Write-Host "Creating Docker network..."
-          docker network create zulip-energy-net-$env:RUN_ID 2>$null
-
-          Write-Host "Starting persistent Zulip CI container..."
-          $containerId = [string](docker run -d `
-            --name "zulip-app-$env:RUN_ID" `
-            --network "zulip-energy-net-$env:RUN_ID" `
-            --platform linux/amd64 `
-            -v "${PWD}:/srv/zulip" `
-            -w /srv/zulip `
-            -e HOME=/home/github `
-            -e CI=true `
-            $env:CI_IMAGE sleep infinity | Select-Object -Last 1)
-          $containerId = $containerId.Trim()
-          Write-Host "Container ID: $containerId"
-
-          Write-Host "Starting services inside container..."
-          docker exec $containerId bash -c "
-            sudo service redis-server start &&
-            sudo service memcached start &&
-            echo 'Core services started.'
-          "
-
-          Write-Host "Running Zulip provisioning (this may take several minutes)..."
-          docker exec $containerId bash -c "
-            cd /srv/zulip &&
-            ./tools/ci/setup-backend --skip-dev-db-build
-          "
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Provisioning returned non-zero exit code $LASTEXITCODE. Attempting to continue..."
-          }
-
-          Write-Host "Provisioning complete."
-          echo "ZULIP_CONTAINER=$containerId" | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
-        shell: powershell
-
       # --- SCENARIO 1: IDLE (BASELINE) ---
       - name: Profile Idle Scenario
         run: |
@@ -158,6 +122,45 @@ jobs:
           . "$env:DATA_DIR\write-json.ps1"
           Write-Utf8JsonNoBom "$env:DATA_DIR\PNPM_Install\duration_check.json" @{ task_seconds = [math]::Round($actualSec,2); profiler_cap_seconds = $profilerCap; usable_cap_seconds = $usableCap; truncated = $truncated }
           if ($truncated) { Write-Error "TRUNCATED: PNPM Install ran ${actualSec}s but usable cap was ${usableCap}s"; exit 1 }
+        shell: powershell
+
+      # --- INFRASTRUCTURE: Provision Zulip inside container (not profiled) ---
+      - name: Provision Zulip Environment
+        run: |
+          Write-Host "Creating Docker network..."
+          docker network create zulip-energy-net-$env:RUN_ID 2>$null
+
+          Write-Host "Starting persistent Zulip CI container..."
+          $containerId = [string](docker run -d `
+            --name "zulip-app-$env:RUN_ID" `
+            --network "zulip-energy-net-$env:RUN_ID" `
+            --platform linux/amd64 `
+            -v "${PWD}:/srv/zulip" `
+            -w /srv/zulip `
+            -e HOME=/home/github `
+            -e CI=true `
+            $env:CI_IMAGE sleep infinity | Select-Object -Last 1)
+          $containerId = $containerId.Trim()
+          Write-Host "Container ID: $containerId"
+
+          Write-Host "Starting services inside container..."
+          docker exec $containerId bash -c "
+            sudo service redis-server start &&
+            sudo service memcached start &&
+            echo 'Core services started.'
+          "
+
+          Write-Host "Running Zulip provisioning (this may take several minutes)..."
+          docker exec $containerId bash -c "
+            cd /srv/zulip &&
+            ./tools/ci/setup-backend --skip-dev-db-build
+          "
+          if ($LASTEXITCODE -ne 0) {
+            throw "Provisioning failed with exit code $LASTEXITCODE"
+          }
+
+          Write-Host "Provisioning complete."
+          echo "ZULIP_CONTAINER=$containerId" | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
         shell: powershell
 
       # --- SCENARIO 3: WEBPACK BUILD ---
@@ -213,7 +216,7 @@ jobs:
             Write-Host "Running backend test span: $Name"
             $startMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
             $testArgs = $TestModules -join " "
-            docker exec $env:ZULIP_CONTAINER bash -c "source tools/ci/activate-venv && ./tools/test-backend $testArgs --parallel=1"
+            docker exec $env:ZULIP_CONTAINER bash -c "source tools/ci/activate-venv && ./tools/test-backend $testArgs "
             $exitCode = $LASTEXITCODE
             $endMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
 
@@ -450,7 +453,7 @@ jobs:
             Write-Host "Running frontend test span: $Name"
             $startMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
             $testArgs = $TestFiles -join " "
-            docker exec $env:ZULIP_CONTAINER bash -c "source tools/ci/activate-venv && ./tools/test-js-with-node $testArgs --parallel=1"
+            docker exec $env:ZULIP_CONTAINER bash -c "source tools/ci/activate-venv && ./tools/test-js-with-node $testArgs "
             $exitCode = $LASTEXITCODE
             $endMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
 
@@ -481,107 +484,97 @@ jobs:
             Invoke-FrontendSpan -Name "node.Calibration.$i" -TestFiles @("util.test.cjs") -TestPath "" -Calibration $true
           }
 
-          # Group 1: Compose
+          # Group 1: compose
           Invoke-FrontendSpan -Name "node.compose" -TestFiles @(
             "compose.test.cjs", "compose_actions.test.cjs", "compose_call.test.cjs",
             "compose_call_session.test.cjs", "compose_closed_ui.test.cjs",
-            "compose_fade.test.cjs", "compose_paste.test.cjs",
-            "compose_pm_pill.test.cjs", "compose_reply.test.cjs",
-            "compose_state.test.cjs"
+            "compose_fade.test.cjs", "compose_paste.test.cjs", "compose_pm_pill.test.cjs",
+            "compose_reply.test.cjs", "compose_state.test.cjs", "compose_ui.test.cjs",
+            "compose_validate.test.cjs", "composebox_typeahead.test.cjs"
           ) -TestPath "web/tests/compose*"
 
-          # Group 2: Message
+          # Group 2: message
           Invoke-FrontendSpan -Name "node.message" -TestFiles @(
-            "message_edit.test.cjs", "message_edit_history.test.cjs",
-            "message_events.test.cjs", "message_fetch.test.cjs",
-            "message_feed_loading.test.cjs", "message_feed_top_notices.test.cjs",
-            "message_groups.test.cjs", "message_helper.test.cjs",
-            "message_list.test.cjs", "message_list_data.test.cjs",
-            "message_list_view.test.cjs", "message_lists.test.cjs",
-            "message_parser.test.cjs", "message_scroll_state.test.cjs",
-            "message_store.test.cjs", "message_view.test.cjs"
+            "message_delete.test.cjs", "message_edit.test.cjs", "message_events.test.cjs",
+            "message_fetch.test.cjs", "message_fetch_raw_content.test.cjs",
+            "message_flags.test.cjs", "message_list.test.cjs", "message_list_data.test.cjs",
+            "message_list_data_cache.test.cjs", "message_list_view.test.cjs",
+            "message_parser.test.cjs", "message_store.test.cjs", "message_util.test.cjs",
+            "message_view.test.cjs"
           ) -TestPath "web/tests/message*"
 
-          # Group 3: Stream/Channel
+          # Group 3: stream
           Invoke-FrontendSpan -Name "node.stream" -TestFiles @(
-            "stream_color.test.cjs", "stream_create_subscribers.test.cjs",
-            "stream_data.test.cjs", "stream_events.test.cjs",
-            "stream_list.test.cjs", "stream_peer_data.test.cjs",
-            "stream_pill.test.cjs", "stream_search_pill.test.cjs",
-            "stream_settings_ui.test.cjs", "stream_sort.test.cjs",
-            "stream_subscription.test.cjs", "stream_topic_history.test.cjs",
-            "channel.test.cjs", "channel_folders.test.cjs"
+            "channel.test.cjs", "channel_folders.test.cjs",
+            "stream_create_subscribers_data.test.cjs", "stream_data.test.cjs",
+            "stream_edit.test.cjs", "stream_events.test.cjs", "stream_list.test.cjs",
+            "stream_list_sort.test.cjs", "stream_pill.test.cjs", "stream_settings_ui.test.cjs",
+            "stream_topic_history.test.cjs"
           ) -TestPath "web/tests/stream*"
 
-          # Group 4: Settings
+          # Group 4: settings
           Invoke-FrontendSpan -Name "node.settings" -TestFiles @(
-            "settings_bots.test.cjs", "settings_config.test.cjs",
-            "settings_data.test.cjs", "settings_org.test.cjs",
-            "settings_user_groups_legacy.test.cjs"
+            "settings_bots.test.cjs", "settings_config.test.cjs", "settings_data.test.cjs",
+            "settings_emoji.test.cjs", "settings_muted_users.test.cjs", "settings_org.test.cjs",
+            "settings_profile_fields.test.cjs", "settings_realm_domains.test.cjs",
+            "settings_user_topics.test.cjs"
           ) -TestPath "web/tests/settings*"
 
-          # Group 5: Activity & Presence
+          # Group 5: activity
           Invoke-FrontendSpan -Name "node.activity" -TestFiles @(
-            "activity.test.cjs", "activity_init.test.cjs",
-            "activity_post.test.cjs", "activity_ui.test.cjs",
-            "buddy_data.test.cjs", "buddy_list.test.cjs",
+            "activity.test.cjs", "activity_init.test.cjs", "activity_post.test.cjs",
+            "activity_ui.test.cjs", "buddy_data.test.cjs", "buddy_list.test.cjs",
             "presence.test.cjs"
           ) -TestPath "web/tests/activity*"
 
-          # Group 6: Search & Filter
+          # Group 6: search
           Invoke-FrontendSpan -Name "node.search" -TestFiles @(
-            "search.test.cjs", "search_future.test.cjs",
-            "search_pill.test.cjs", "filter.test.cjs"
+            "filter.test.cjs", "search.test.cjs", "search_suggestion.test.cjs"
           ) -TestPath "web/tests/search*"
 
-          # Group 7: Misc (everything else — run the full suite minus specific files)
+          # Group 7: misc
           Invoke-FrontendSpan -Name "node.misc" -TestFiles @(
-            "alert_words.test.cjs", "alert_words_ui.test.cjs",
-            "bot_data.test.cjs", "browser_history.test.cjs",
-            "browser_support.test.cjs", "clipboard_handler.test.cjs",
-            "color_data.test.cjs", "common.test.cjs",
-            "components.test.cjs", "copy_and_paste.test.cjs",
-            "csrf.test.cjs", "custom_profile_fields_ui.test.cjs",
-            "desktop_integration.test.cjs", "dialog_widget.test.cjs",
-            "dispatch.test.cjs", "drafts.test.cjs",
-            "echo.test.cjs", "emoji.test.cjs", "emoji_picker.test.cjs",
-            "feedback_widget.test.cjs", "flatpickr.test.cjs",
-            "fold_dict.test.cjs", "hash_util.test.cjs",
-            "hashchange.test.cjs", "hotkey.test.cjs",
-            "i18n.test.cjs", "input_pill.test.cjs",
-            "integration_url_modal.test.cjs",
-            "lib.test.cjs", "lightbox.test.cjs",
-            "list_widget.test.cjs", "listbox_selector.test.cjs",
-            "markdown.test.cjs", "markdown_parse.test.cjs",
-            "muted_users.test.cjs", "narrow.test.cjs",
-            "narrow_activate.test.cjs", "narrow_local.test.cjs",
-            "narrow_state.test.cjs", "navbar_alerts.test.cjs",
-            "navigate.test.cjs", "notifications.test.cjs",
-            "onboarding_steps.test.cjs", "overlays.test.cjs",
-            "padded_widget.test.cjs", "people.test.cjs",
-            "pm_conversations.test.cjs", "pm_list_data.test.cjs",
+            "alert_words.test.cjs", "alert_words_ui.test.cjs", "background_task.test.cjs",
+            "blueslip_stacktrace.test.cjs", "bot_data.test.cjs", "box_resize.test.cjs",
+            "browser_history.test.cjs", "browser_support.test.cjs",
+            "clipboard_handler.test.cjs", "color_data.test.cjs", "common.test.cjs",
+            "components.test.cjs", "conversation_participants.test.cjs", "date_util.test.cjs",
+            "demo_organizations.test.cjs", "deprecated_feature_notice.test.cjs",
+            "direct_message_group_data.test.cjs", "dispatch.test.cjs", "dispatch_subs.test.cjs",
+            "drafts.test.cjs", "echo.test.cjs", "electron_bridge.test.cjs", "emoji.test.cjs",
+            "emoji_picker.test.cjs", "example1.test.cjs", "example2.test.cjs",
+            "example3.test.cjs", "example4.test.cjs", "example5.test.cjs", "example6.test.cjs",
+            "example7.test.cjs", "example8.test.cjs", "fenced_code.test.cjs",
+            "fetch_status.test.cjs", "focus_outline_util.test.cjs", "fold_dict.test.cjs",
+            "folder_dropdown_widget.test.cjs", "gear_menu_util.test.cjs", "hash_util.test.cjs",
+            "hashchange.test.cjs", "hotkey.test.cjs", "i18n.test.cjs", "input_pill.test.cjs",
+            "internal_url.test.cjs", "keydown_util.test.cjs", "lazy_set.test.cjs",
+            "left_sidebar_navigation_area.test.cjs", "lightbox.test.cjs", "linkifiers.test.cjs",
+            "list_cursor.test.cjs", "list_widget.test.cjs", "markdown.test.cjs",
+            "markdown_parse.test.cjs", "muted_users.test.cjs", "narrow_local.test.cjs",
+            "narrow_state.test.cjs", "narrow_unread.test.cjs", "navbar_alerts.test.cjs",
+            "navigation_views.test.cjs", "notifications.test.cjs", "password.test.cjs",
+            "peer_data.test.cjs", "people.test.cjs", "people_errors.test.cjs",
+            "pill_typeahead.test.cjs", "pm_conversations.test.cjs",
+            "pm_conversations_util.test.cjs", "pm_list.test.cjs", "pm_list_data.test.cjs",
             "poll_widget.test.cjs", "popover_menus_data.test.cjs",
-            "popovers.test.cjs", "reactions.test.cjs",
-            "recent_senders.test.cjs", "recent_view_data.test.cjs",
-            "recent_view_util.test.cjs", "rendered_markdown.test.cjs",
-            "scheduled_messages.test.cjs", "scroll_util.test.cjs",
-            "server_events.test.cjs", "spoilers.test.cjs",
-            "starred_messages.test.cjs", "state_data.test.cjs",
-            "submessage.test.cjs", "subscriber_api.test.cjs",
-            "timerender.test.cjs", "todo_widget.test.cjs",
-            "topic_link_util.test.cjs", "topic_list.test.cjs",
-            "topic_list_data.test.cjs", "transmit.test.cjs",
-            "tutorial.test.cjs", "typeahead.test.cjs",
-            "typeahead_helper.test.cjs", "typing.test.cjs",
-            "typing_events.test.cjs", "typing_status.test.cjs",
-            "unread.test.cjs", "unread_ops.test.cjs",
-            "upload.test.cjs", "url_encoding.test.cjs",
-            "user_card_popover.test.cjs", "user_deactivation.test.cjs",
-            "user_groups.test.cjs", "user_pill.test.cjs",
-            "user_search.test.cjs", "user_status.test.cjs",
-            "user_status_ui.test.cjs", "user_topics.test.cjs",
-            "util.test.cjs", "vdom.test.cjs",
-            "widgetize.test.cjs"
+            "postprocess_content.test.cjs", "reactions.test.cjs", "realm_playground.test.cjs",
+            "recent_senders.test.cjs", "recent_view.test.cjs", "reload.test.cjs",
+            "reload_state.test.cjs", "rendered_markdown.test.cjs", "resolved_topic.test.cjs",
+            "rtl.test.cjs", "saved_snippets.test.cjs", "scheduled_messages.test.cjs",
+            "scroll_util.test.cjs", "server_events.test.cjs",
+            "sidebar_header_sticky_shadow.test.cjs", "spoilers.test.cjs",
+            "starred_messages.test.cjs", "submessage.test.cjs", "support.test.cjs",
+            "templates.test.cjs", "timerender.test.cjs", "topic_generator.test.cjs",
+            "topic_link_util.test.cjs", "topic_list.test.cjs", "topic_list_data.test.cjs",
+            "transmit.test.cjs", "typeahead.test.cjs", "typeahead_helper.test.cjs",
+            "typeahead_sorting_logic.test.cjs", "typing_data.test.cjs",
+            "typing_events.test.cjs", "typing_status.test.cjs", "ui_util.test.cjs",
+            "unread.test.cjs", "unread_ops.test.cjs", "upload.test.cjs", "user_events.test.cjs",
+            "user_group_pill.test.cjs", "user_groups.test.cjs", "user_pill.test.cjs",
+            "user_search.test.cjs", "user_status.test.cjs", "user_topics.test.cjs",
+            "user_topics_ui.test.cjs", "util.test.cjs", "vdom.test.cjs", "watchdog.test.cjs",
+            "widgetize.test.cjs", "zblueslip.test.cjs", "zjquery.test.cjs"
           ) -TestPath "web/tests/misc"
 
           $scenarioEndClock = Get-Date
@@ -764,17 +757,62 @@ jobs:
       - name: Build ARM64 CI Image
         run: |
           echo "Building native ARM64 Zulip CI image from tools/ci/Dockerfile..."
-          # Build without --platform=linux/amd64 to get native arm64
+          # The upstream Dockerfile hardcodes FROM --platform=linux/amd64, which on
+          # Apple Silicon would silently build an emulated x86 image. Strip the pin.
+          sed 's/^FROM --platform=linux\/amd64 /FROM /' tools/ci/Dockerfile > tools/ci/Dockerfile.arm64
+          grep -q '^FROM \$BASE_IMAGE' tools/ci/Dockerfile.arm64 || { echo "ERROR: platform pin not stripped"; exit 1; }
           docker build tools/ci/ \
+            --platform linux/arm64 \
             --build-arg=BASE_IMAGE=debian:bookworm \
             --tag zulip-ci-arm64:latest \
-            --file tools/ci/Dockerfile
+            --file tools/ci/Dockerfile.arm64
+          ARCH=$(docker run --rm zulip-ci-arm64:latest uname -m)
+          echo "Image architecture: $ARCH"
+          if [ "$ARCH" != "aarch64" ]; then echo "ERROR: expected aarch64 but got $ARCH"; exit 1; fi
           echo "ARM64 CI image built successfully."
         shell: bash
 
       - name: Pre-pull Images
         run: |
           docker pull --platform linux/arm64 node:22-slim
+        shell: bash
+
+      # --- SCENARIO 1: IDLE (BASELINE) ---
+      - name: Profile Idle Scenario
+        run: |
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          sudo powermetrics --samplers cpu_power -i 100 -n 600 > "$DATA_DIR/Idle/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 30
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+          echo "Idle_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/Idle/timestamps.csv"
+          echo "Idle_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/Idle/timestamps.csv"
+        shell: bash
+
+      # --- SCENARIO 2: PNPM INSTALL ---
+      - name: Profile PNPM Install
+        run: |
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          PROFILER_CAP=900
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$DATA_DIR/PNPM_Install/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/arm64 node:22-slim sh -c "corepack enable && corepack prepare pnpm@11.22.0 --activate && pnpm install --frozen-lockfile" || true
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+          echo "PNPM_Install_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/PNPM_Install/timestamps.csv"
+          echo "PNPM_Install_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/PNPM_Install/timestamps.csv"
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          echo "{\"task_seconds\": $ACTUAL_SEC, \"profiler_cap_seconds\": $PROFILER_CAP, \"usable_cap_seconds\": $USABLE_CAP, \"truncated\": $TRUNCATED}" > "$DATA_DIR/PNPM_Install/duration_check.json"
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: PNPM Install ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
         shell: bash
 
       # --- INFRASTRUCTURE: Provision Zulip inside container (not profiled) ---
@@ -830,44 +868,6 @@ jobs:
 
           echo "Provisioning complete."
           echo "ZULIP_CONTAINER=$CONTAINER_ID" >> "$GITHUB_ENV"
-        shell: bash
-
-      # --- SCENARIO 1: IDLE (BASELINE) ---
-      - name: Profile Idle Scenario
-        run: |
-          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
-          sudo powermetrics --samplers cpu_power -i 100 -n 600 > "$DATA_DIR/Idle/power_data.txt" 2>/dev/null &
-          PROF_PID=$!
-          sleep 10
-          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
-          sleep 30
-          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
-          sleep 10
-          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
-          echo "Idle_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/Idle/timestamps.csv"
-          echo "Idle_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/Idle/timestamps.csv"
-        shell: bash
-
-      # --- SCENARIO 2: PNPM INSTALL ---
-      - name: Profile PNPM Install
-        run: |
-          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
-          PROFILER_CAP=900
-          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$DATA_DIR/PNPM_Install/power_data.txt" 2>/dev/null &
-          PROF_PID=$!
-          sleep 10
-          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
-          docker run --rm -v "${PWD}:/app" -w /app --platform linux/arm64 node:22-slim sh -c "corepack enable && corepack prepare pnpm@11.22.0 --activate && pnpm install --frozen-lockfile" || true
-          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
-          sleep 10
-          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
-          echo "PNPM_Install_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/PNPM_Install/timestamps.csv"
-          echo "PNPM_Install_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/PNPM_Install/timestamps.csv"
-          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
-          USABLE_CAP=$((PROFILER_CAP - 20))
-          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
-          echo "{\"task_seconds\": $ACTUAL_SEC, \"profiler_cap_seconds\": $PROFILER_CAP, \"usable_cap_seconds\": $USABLE_CAP, \"truncated\": $TRUNCATED}" > "$DATA_DIR/PNPM_Install/duration_check.json"
-          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: PNPM Install ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
         shell: bash
 
       # --- SCENARIO 3: WEBPACK BUILD ---
@@ -1136,7 +1136,7 @@ jobs:
             echo "Running frontend test span: $name"
             local start_ms end_ms exit_code
             start_ms=$(node -e "console.log(Date.now())")
-            if docker exec "$ZULIP_CONTAINER" bash -c "source tools/ci/activate-venv && ./tools/test-js-with-node $* --parallel=1"; then
+            if docker exec "$ZULIP_CONTAINER" bash -c "source tools/ci/activate-venv && ./tools/test-js-with-node $*"; then
               exit_code=0
             else
               exit_code=$?
@@ -1159,100 +1159,83 @@ jobs:
             run_frontend_span "node.Calibration.$REP" "true" "" util.test.cjs
           done
 
-          # Group 1: Compose
+          # Group 1: compose
           run_frontend_span "node.compose" "false" "web/tests/compose*" \
             compose.test.cjs compose_actions.test.cjs compose_call.test.cjs \
-            compose_call_session.test.cjs compose_closed_ui.test.cjs \
-            compose_fade.test.cjs compose_paste.test.cjs \
-            compose_pm_pill.test.cjs compose_reply.test.cjs \
-            compose_state.test.cjs
+            compose_call_session.test.cjs compose_closed_ui.test.cjs compose_fade.test.cjs \
+            compose_paste.test.cjs compose_pm_pill.test.cjs compose_reply.test.cjs \
+            compose_state.test.cjs compose_ui.test.cjs compose_validate.test.cjs \
+            composebox_typeahead.test.cjs
 
-          # Group 2: Message
+          # Group 2: message
           run_frontend_span "node.message" "false" "web/tests/message*" \
-            message_edit.test.cjs message_edit_history.test.cjs \
-            message_events.test.cjs message_fetch.test.cjs \
-            message_feed_loading.test.cjs message_feed_top_notices.test.cjs \
-            message_groups.test.cjs message_helper.test.cjs \
-            message_list.test.cjs message_list_data.test.cjs \
-            message_list_view.test.cjs message_lists.test.cjs \
-            message_parser.test.cjs message_scroll_state.test.cjs \
-            message_store.test.cjs message_view.test.cjs
+            message_delete.test.cjs message_edit.test.cjs message_events.test.cjs \
+            message_fetch.test.cjs message_fetch_raw_content.test.cjs message_flags.test.cjs \
+            message_list.test.cjs message_list_data.test.cjs message_list_data_cache.test.cjs \
+            message_list_view.test.cjs message_parser.test.cjs message_store.test.cjs \
+            message_util.test.cjs message_view.test.cjs
 
-          # Group 3: Stream/Channel
+          # Group 3: stream
           run_frontend_span "node.stream" "false" "web/tests/stream*" \
-            stream_color.test.cjs stream_create_subscribers.test.cjs \
-            stream_data.test.cjs stream_events.test.cjs \
-            stream_list.test.cjs stream_peer_data.test.cjs \
-            stream_pill.test.cjs stream_search_pill.test.cjs \
-            stream_settings_ui.test.cjs stream_sort.test.cjs \
-            stream_subscription.test.cjs stream_topic_history.test.cjs \
-            channel.test.cjs channel_folders.test.cjs
+            channel.test.cjs channel_folders.test.cjs stream_create_subscribers_data.test.cjs \
+            stream_data.test.cjs stream_edit.test.cjs stream_events.test.cjs \
+            stream_list.test.cjs stream_list_sort.test.cjs stream_pill.test.cjs \
+            stream_settings_ui.test.cjs stream_topic_history.test.cjs
 
-          # Group 4: Settings
+          # Group 4: settings
           run_frontend_span "node.settings" "false" "web/tests/settings*" \
-            settings_bots.test.cjs settings_config.test.cjs \
-            settings_data.test.cjs settings_org.test.cjs \
-            settings_user_groups_legacy.test.cjs
+            settings_bots.test.cjs settings_config.test.cjs settings_data.test.cjs \
+            settings_emoji.test.cjs settings_muted_users.test.cjs settings_org.test.cjs \
+            settings_profile_fields.test.cjs settings_realm_domains.test.cjs \
+            settings_user_topics.test.cjs
 
-          # Group 5: Activity
+          # Group 5: activity
           run_frontend_span "node.activity" "false" "web/tests/activity*" \
-            activity.test.cjs activity_init.test.cjs \
-            activity_post.test.cjs activity_ui.test.cjs \
-            buddy_data.test.cjs buddy_list.test.cjs \
-            presence.test.cjs
+            activity.test.cjs activity_init.test.cjs activity_post.test.cjs activity_ui.test.cjs \
+            buddy_data.test.cjs buddy_list.test.cjs presence.test.cjs
 
-          # Group 6: Search
+          # Group 6: search
           run_frontend_span "node.search" "false" "web/tests/search*" \
-            search.test.cjs search_future.test.cjs \
-            search_pill.test.cjs filter.test.cjs
+            filter.test.cjs search.test.cjs search_suggestion.test.cjs
 
-          # Group 7: Misc
+          # Group 7: misc
           run_frontend_span "node.misc" "false" "web/tests/misc" \
-            alert_words.test.cjs alert_words_ui.test.cjs \
-            bot_data.test.cjs browser_history.test.cjs \
-            browser_support.test.cjs clipboard_handler.test.cjs \
-            color_data.test.cjs common.test.cjs \
-            components.test.cjs copy_and_paste.test.cjs \
-            csrf.test.cjs custom_profile_fields_ui.test.cjs \
-            desktop_integration.test.cjs dialog_widget.test.cjs \
-            dispatch.test.cjs drafts.test.cjs \
-            echo.test.cjs emoji.test.cjs emoji_picker.test.cjs \
-            feedback_widget.test.cjs flatpickr.test.cjs \
-            fold_dict.test.cjs hash_util.test.cjs \
-            hashchange.test.cjs hotkey.test.cjs \
-            i18n.test.cjs input_pill.test.cjs \
-            integration_url_modal.test.cjs \
-            lib.test.cjs lightbox.test.cjs \
-            list_widget.test.cjs listbox_selector.test.cjs \
-            markdown.test.cjs markdown_parse.test.cjs \
-            muted_users.test.cjs narrow.test.cjs \
-            narrow_activate.test.cjs narrow_local.test.cjs \
-            narrow_state.test.cjs navbar_alerts.test.cjs \
-            navigate.test.cjs notifications.test.cjs \
-            onboarding_steps.test.cjs overlays.test.cjs \
-            padded_widget.test.cjs people.test.cjs \
-            pm_conversations.test.cjs pm_list_data.test.cjs \
-            poll_widget.test.cjs popover_menus_data.test.cjs \
-            popovers.test.cjs reactions.test.cjs \
-            recent_senders.test.cjs recent_view_data.test.cjs \
-            recent_view_util.test.cjs rendered_markdown.test.cjs \
-            scheduled_messages.test.cjs scroll_util.test.cjs \
-            server_events.test.cjs spoilers.test.cjs \
-            starred_messages.test.cjs state_data.test.cjs \
-            submessage.test.cjs subscriber_api.test.cjs \
-            timerender.test.cjs todo_widget.test.cjs \
-            topic_link_util.test.cjs topic_list.test.cjs \
-            topic_list_data.test.cjs transmit.test.cjs \
-            tutorial.test.cjs typeahead.test.cjs \
-            typeahead_helper.test.cjs typing.test.cjs \
-            typing_events.test.cjs typing_status.test.cjs \
-            unread.test.cjs unread_ops.test.cjs \
-            upload.test.cjs url_encoding.test.cjs \
-            user_card_popover.test.cjs user_deactivation.test.cjs \
-            user_groups.test.cjs user_pill.test.cjs \
-            user_search.test.cjs user_status.test.cjs \
-            user_status_ui.test.cjs user_topics.test.cjs \
-            vdom.test.cjs widgetize.test.cjs
+            alert_words.test.cjs alert_words_ui.test.cjs background_task.test.cjs \
+            blueslip_stacktrace.test.cjs bot_data.test.cjs box_resize.test.cjs \
+            browser_history.test.cjs browser_support.test.cjs clipboard_handler.test.cjs \
+            color_data.test.cjs common.test.cjs components.test.cjs \
+            conversation_participants.test.cjs date_util.test.cjs demo_organizations.test.cjs \
+            deprecated_feature_notice.test.cjs direct_message_group_data.test.cjs \
+            dispatch.test.cjs dispatch_subs.test.cjs drafts.test.cjs echo.test.cjs \
+            electron_bridge.test.cjs emoji.test.cjs emoji_picker.test.cjs example1.test.cjs \
+            example2.test.cjs example3.test.cjs example4.test.cjs example5.test.cjs \
+            example6.test.cjs example7.test.cjs example8.test.cjs fenced_code.test.cjs \
+            fetch_status.test.cjs focus_outline_util.test.cjs fold_dict.test.cjs \
+            folder_dropdown_widget.test.cjs gear_menu_util.test.cjs hash_util.test.cjs \
+            hashchange.test.cjs hotkey.test.cjs i18n.test.cjs input_pill.test.cjs \
+            internal_url.test.cjs keydown_util.test.cjs lazy_set.test.cjs \
+            left_sidebar_navigation_area.test.cjs lightbox.test.cjs linkifiers.test.cjs \
+            list_cursor.test.cjs list_widget.test.cjs markdown.test.cjs markdown_parse.test.cjs \
+            muted_users.test.cjs narrow_local.test.cjs narrow_state.test.cjs \
+            narrow_unread.test.cjs navbar_alerts.test.cjs navigation_views.test.cjs \
+            notifications.test.cjs password.test.cjs peer_data.test.cjs people.test.cjs \
+            people_errors.test.cjs pill_typeahead.test.cjs pm_conversations.test.cjs \
+            pm_conversations_util.test.cjs pm_list.test.cjs pm_list_data.test.cjs \
+            poll_widget.test.cjs popover_menus_data.test.cjs postprocess_content.test.cjs \
+            reactions.test.cjs realm_playground.test.cjs recent_senders.test.cjs \
+            recent_view.test.cjs reload.test.cjs reload_state.test.cjs \
+            rendered_markdown.test.cjs resolved_topic.test.cjs rtl.test.cjs \
+            saved_snippets.test.cjs scheduled_messages.test.cjs scroll_util.test.cjs \
+            server_events.test.cjs sidebar_header_sticky_shadow.test.cjs spoilers.test.cjs \
+            starred_messages.test.cjs submessage.test.cjs support.test.cjs templates.test.cjs \
+            timerender.test.cjs topic_generator.test.cjs topic_link_util.test.cjs \
+            topic_list.test.cjs topic_list_data.test.cjs transmit.test.cjs typeahead.test.cjs \
+            typeahead_helper.test.cjs typeahead_sorting_logic.test.cjs typing_data.test.cjs \
+            typing_events.test.cjs typing_status.test.cjs ui_util.test.cjs unread.test.cjs \
+            unread_ops.test.cjs upload.test.cjs user_events.test.cjs user_group_pill.test.cjs \
+            user_groups.test.cjs user_pill.test.cjs user_search.test.cjs user_status.test.cjs \
+            user_topics.test.cjs user_topics_ui.test.cjs util.test.cjs vdom.test.cjs \
+            watchdog.test.cjs widgetize.test.cjs zblueslip.test.cjs zjquery.test.cjs
 
           END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
 
