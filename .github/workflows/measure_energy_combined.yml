@@ -876,11 +876,7 @@ jobs:
           for ATTEMPT in 1 2 3; do
             if docker exec "$CONTAINER_ID" bash -c "
               cd /srv/zulip &&
-              corepack pnpm config set fetch-timeout 600000 &&
-              corepack pnpm config set fetch-retries 6 &&
-              corepack pnpm config set fetch-retry-mintimeout 10000 &&
-              corepack pnpm config set fetch-retry-maxtimeout 120000 &&
-              corepack pnpm config set network-concurrency 8 &&
+              printf '%s\n' fetch-timeout=600000 fetch-retries=6 fetch-retry-mintimeout=10000 fetch-retry-maxtimeout=120000 network-concurrency=8 > ~/.npmrc &&
               ./tools/ci/setup-backend --skip-dev-db-build
             "; then
               break
